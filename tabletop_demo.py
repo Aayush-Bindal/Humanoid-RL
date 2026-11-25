@@ -113,29 +113,52 @@ def obstacle_boxes(mask):
     return boxes
 
 
-def plan_route(boxes, origin=START, clearance=CLEARANCE):
+def position_clear(point, boxes, clearance=CLEARANCE):
+    x, y = point
+    return (0.5 <= x <= LENGTH - 0.5 and 0.5 <= y <= SPAN - 0.5 and
+            all(not (x1 - clearance <= x <= x2 + clearance and
+                     y1 - clearance <= y <= y2 + clearance)
+                for x1, y1, x2, y2 in boxes))
+
+
+def segment_clear(origin, destination, boxes, clearance):
+    samples = max(1, math.ceil(math.dist(origin, destination) / 0.04))
+    for index in range(samples + 1):
+        fraction = index / samples
+        point = (origin[0] + (destination[0] - origin[0]) * fraction,
+                 origin[1] + (destination[1] - origin[1]) * fraction)
+        if not position_clear(point, boxes, clearance):
+            return False
+    return True
+
+
+def plan_route(boxes, origin=START, clearance=CLEARANCE, destination=GOAL):
     """Find a shortest collision-free route through a grid with body clearance."""
     spacing = 0.1
 
     def available(x, y):
-        if not (0.5 <= x <= LENGTH - 0.5 and 0.5 <= y <= SPAN - 0.5):
-            return False
-        return all(not (x1 - clearance <= x <= x2 + clearance and
-                        y1 - clearance <= y <= y2 + clearance)
-                   for x1, y1, x2, y2 in boxes)
+        return position_clear((x, y), boxes, clearance)
 
     def clear(a, b):
-        samples = max(1, math.ceil(math.dist(a, b) / 0.04))
-        return all(available(a[0] + (b[0] - a[0]) * i / samples,
-                             a[1] + (b[1] - a[1]) * i / samples)
-                   for i in range(samples + 1))
+        return segment_clear(a, b, boxes, clearance)
 
-    if not available(*origin) or not available(*GOAL):
-        raise ValueError("The start or goal is blocked. Move the nearby obstacle.")
-    if clear(origin, GOAL):
-        return [origin, GOAL]
-    start = tuple(round(value / spacing) for value in origin)
-    goal = tuple(round(value / spacing) for value in GOAL)
+    if not available(*origin):
+        raise ValueError("The robot needs more room around it.")
+    if not available(*destination):
+        raise ValueError("Choose a point farther from the table edge or an object.")
+    if clear(origin, destination):
+        return [origin, destination]
+
+    def grid_node(point):
+        column, row = (round(value / spacing) for value in point)
+        candidates = [(x, y) for x in range(column - 1, column + 2)
+                      for y in range(row - 1, row + 2)
+                      if clear(point, (x * spacing, y * spacing))]
+        if not candidates:
+            raise ValueError("The route has insufficient clearance.")
+        return min(candidates, key=lambda node: math.dist(point, (node[0] * spacing, node[1] * spacing)))
+
+    start, goal = grid_node(origin), grid_node(destination)
     distance = {start: 0}
     parent = {start: None}
     queue = [(math.dist(start, goal), 0, start)]
@@ -150,7 +173,7 @@ def plan_route(boxes, origin=START, clearance=CLEARANCE):
             neighbor = (x + dx, y + dy)
             if cost + 1 >= distance.get(neighbor, math.inf):
                 continue
-            if available(neighbor[0] * spacing, neighbor[1] * spacing):
+            if clear((x * spacing, y * spacing), (neighbor[0] * spacing, neighbor[1] * spacing)):
                 distance[neighbor] = cost + 1
                 parent[neighbor] = current
                 priority = cost + 1 + math.dist(neighbor, goal)
@@ -163,7 +186,8 @@ def plan_route(boxes, origin=START, clearance=CLEARANCE):
         points.append(tuple(value * spacing for value in node))
         node = parent[node]
     points.reverse()
-    points[0] = origin
+    points.insert(0, origin)
+    points.append(destination)
     route = [origin]
     index = 0
     while index < len(points) - 1:
@@ -208,10 +232,13 @@ def make_course(boxes, route, directory, render, overlay=False):
                                            "elevation": -54, "lookat": np.array([4.0, 2.5, 0.2])})
 
 
-def steer(sim, torso, delta):
+def steer(sim, torso, delta, max_speed=1.0):
     """Apply the virtual harness forces for one policy step."""
     distance = np.linalg.norm(delta)
-    desired_velocity = min(1.0, 2.0 * distance) * delta / distance
+    if distance < 1e-8:
+        sim.data.xfrc_applied[torso] = 0
+        return
+    desired_velocity = min(max_speed, 2.0 * distance) * delta / distance
     rotation = sim.data.xmat[torso].reshape(3, 3)
     velocity = np.zeros(6)
     mujoco.mj_objectVelocity(sim.model, sim.data, mujoco.mjtObj.mjOBJ_BODY, torso, velocity, 0)
@@ -240,12 +267,12 @@ def run_course(boxes, route, checkpoint, render):
             env.close()
 
 
-def walk(env, boxes, route, policy, render):
+def walk(env, boxes, route, policy, render, *, max_speed=1.0, stop=None):
     sim = env.unwrapped
     # Set the starting pose before rendering the first frame.
     rng = np.random.default_rng(0)
     qpos = sim.init_qpos + rng.uniform(-0.005, 0.005, size=sim.model.nq)
-    qpos[:2] = START
+    qpos[:2] = route[0]
     mujoco.mj_normalizeQuat(sim.model, qpos)
     sim.set_state(qpos, np.zeros(sim.model.nv))
     # Step the unwrapped environment after initializing its state here.
@@ -254,6 +281,8 @@ def walk(env, boxes, route, policy, render):
     obstacle_ids = {sim.model.geom(f"obstacle_{i}").id for i in range(len(boxes))}
     target_index = 1
     for step in range(1800):
+        if stop is not None and stop.is_set():
+            return False, "Practice stopped."
         started = time.perf_counter()
         position = sim.data.qpos[:2]
         target = np.asarray(route[target_index])
@@ -264,7 +293,7 @@ def walk(env, boxes, route, policy, render):
                 return True, f"Reached goal in {step * sim.dt:.1f} simulated seconds with zero obstacle contacts."
             target_index += 1
             target = np.asarray(route[target_index])
-        steer(sim, torso, target - position)
+        steer(sim, torso, target - position, max_speed=max_speed)
         action, _ = policy.predict(observation, deterministic=True)
         observation, _, fell, _, _ = sim.step(action)
         for contact in sim.data.contact:

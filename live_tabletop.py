@@ -1,6 +1,8 @@
 """Detect a white tabletop and anchor the simulated walker to it in live video."""
 
 from collections import deque
+import math
+import sqlite3
 import subprocess
 from tempfile import TemporaryDirectory, TemporaryFile
 from threading import Thread
@@ -12,12 +14,14 @@ from PIL import Image, ImageDraw, ImageFilter
 from stable_baselines3 import PPO
 from torch import set_num_threads
 
-from table_vision import TABLE_SIZE, TablePlane, find_table
-from tabletop_demo import GOAL, LENGTH, SPAN, START
-from tabletop_demo import make_course, plan_route, steer
+from navigation_learning import NavigationLearning, SETTINGS
+from table_vision import TABLE_SIZE, TableTracker
+from tabletop_demo import LENGTH, SPAN, START
+from tabletop_demo import make_course, plan_route, position_clear, segment_clear, steer
 
 
 VIDEO_SIZE = TABLE_SIZE
+CAMERA_SIZE = (960, 600)
 
 
 class Webcam:
@@ -27,7 +31,7 @@ class Webcam:
         command = [
             "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
             "-f", "dshow", "-i", f"video={camera}", "-an",
-            "-vf", "crop=w='min(iw,ih*1.6)':h='min(ih,iw/1.6)',scale=640:400,fps=24",
+            "-vf", "crop=w='min(iw,ih*1.6)':h='min(ih,iw/1.6)',scale=960:600,fps=24",
             "-pix_fmt", "rgb24", "-threads", "1", "-f", "rawvideo", "pipe:1",
         ]
         try:
@@ -42,12 +46,12 @@ class Webcam:
         self.reader.start()
 
     def read_frames(self):
-        size = VIDEO_SIZE[0] * VIDEO_SIZE[1] * 3
+        size = CAMERA_SIZE[0] * CAMERA_SIZE[1] * 3
         with self.process.stdout as stream:
             while raw := stream.read(size):
                 if len(raw) != size:
                     break
-                self.frames.append(Image.frombytes("RGB", VIDEO_SIZE, raw))
+                self.frames.append(Image.frombytes("RGB", CAMERA_SIZE, raw))
 
     def error(self):
         self.errors.seek(0)
@@ -97,42 +101,100 @@ class OverlayWalker:
         self.reset()
 
     def reset(self):
+        self.route = deque()
+        self.boxes = []
+        self.destination = None
+        self.spawned = False
+        self.settings = SETTINGS[0]
+        self.elapsed = 0
+        self.distance = 0
+        self.outcome = None
+        self.status = "Click a clear spot on the table"
+
+    def spawn(self):
+        if self.spawned:
+            return True
+        candidates = [START, (1.4, 1.1), (1.4, 3.9), (4.0, 1.1), (4.0, 3.9), (7.0, 2.5)]
+        position = next((point for point in candidates if position_clear(point, self.boxes)), None)
+        if position is None:
+            self.status = "Clear a spot so the robot can spawn"
+            return False
         self.env.reset(seed=0)
         qpos = self.sim.data.qpos.copy()
-        qpos[:2] = START
+        qpos[:2] = position
         self.sim.set_state(qpos, np.zeros(self.sim.model.nv))
-        self.route = deque()
-        self.boxes = None
-        self.goal_time = None
+        self.spawned = True
+        self.status = "Click a clear spot on the table"
+        return True
+
+    def choose_destination(self, destination, settings):
+        if not self.spawned:
+            raise ValueError("Clear a spot so the robot can spawn.")
+        origin = tuple(self.sim.data.qpos[:2])
+        route = plan_route(self.boxes, origin, settings.clearance, destination)
+        self.route = deque(route[1:])
+        self.destination = destination
+        self.settings = settings
+        self.elapsed = 0
+        self.distance = math.dist(origin, destination)
+        self.status = "Walking to your marker"
 
     def replan(self, boxes):
+        if self.boxes == boxes and self.spawned:
+            return
         self.boxes = boxes
+        if not self.spawn() or self.destination is None or self.status == "Arrived":
+            return
         origin = tuple(self.sim.data.qpos[:2])
+        # Minor box jitter should not replace a route that still has clearance.
+        if self.route:
+            points = [origin, *self.route]
+            if all(segment_clear(a, b, boxes, self.settings.clearance - 0.12)
+                   for a, b in zip(points, points[1:])):
+                return
         try:
-            self.route = deque(plan_route(boxes, origin=origin)[1:])
+            self.route = deque(plan_route(boxes, origin=origin,
+                                          clearance=self.settings.clearance,
+                                          destination=self.destination)[1:])
+            self.status = "Walking to your marker"
         except ValueError:
             self.route.clear()
+            self.status = "Path blocked. Move the object or choose a new spot"
+
+    def finish(self, reached, status):
+        self.route.clear()
+        self.status = status
+        if self.distance >= 0.3:
+            self.outcome = (self.settings, reached, self.elapsed, self.distance)
+        if not reached:
+            self.destination = None
+        return self.status
 
     def advance(self, steps):
-        if self.goal_time is not None:
-            return "Reached the goal"
         if not self.route:
-            return "Path blocked · move an object to make room"
+            return self.status
         for _ in range(steps):
             position = self.sim.data.qpos[:2]
             if np.linalg.norm(np.asarray(self.route[0]) - position) < 0.18:
                 self.route.popleft()
                 if not self.route:
-                    self.goal_time = time.monotonic()
-                    return "Reached the goal"
+                    return self.finish(True, "Arrived")
             delta = np.asarray(self.route[0]) - position
-            steer(self.sim, self.torso, delta)
+            steer(self.sim, self.torso, delta, max_speed=self.settings.speed)
             action, _ = self.policy.predict(self.sim._get_obs(), deterministic=True)
+            previous_pose = self.sim.data.qpos.copy()
             _, _, fell, _, _ = self.sim.step(action)
+            self.elapsed += self.sim.dt
             if fell:
-                self.reset()
-                return "Restarting"
-        return "Walking · route updates as objects move"
+                self.spawned = False
+                self.spawn()
+                return self.finish(False, "Lost balance. Choose another spot")
+            if not position_clear(self.sim.data.qpos[:2], self.boxes, clearance=0.30):
+                self.sim.set_state(previous_pose, np.zeros(self.sim.model.nv))
+                return self.finish(False, "Stopped near an obstacle. Choose another spot")
+            if self.elapsed >= 27:
+                return self.finish(False, "Trip timed out. Choose another spot")
+        return self.status
 
     def render_avatar(self):
         """Render the pose as a transparent image with its natural proportions."""
@@ -154,18 +216,24 @@ class OverlayWalker:
     def composite(self, frame, table, guides=False):
         """Project ground marks, then place the upright avatar at its ground point."""
         width, height = VIDEO_SIZE
-        x, y = self.sim.data.qpos[:2]
-        u, v = x / LENGTH * width, y / SPAN * height
         layer = Image.new("RGBA", VIDEO_SIZE)
         draw = ImageDraw.Draw(layer)
-        draw.ellipse((u - 18, v - 11, u + 18, v + 11), fill=(7, 16, 20, 105))
+        if self.spawned:
+            x, y = self.sim.data.qpos[:2]
+            u, v = x / LENGTH * width, y / SPAN * height
+            draw.ellipse((u - 18, v - 11, u + 18, v + 11), fill=(7, 16, 20, 105))
         layer = layer.filter(ImageFilter.GaussianBlur(5))
         draw = ImageDraw.Draw(layer)
-        goal_x = GOAL[0] / LENGTH * width
-        goal_y = GOAL[1] / SPAN * height
-        draw.ellipse((goal_x - 13, goal_y - 11, goal_x + 13, goal_y + 11),
-                     fill=(28, 168, 142, 90), outline="#77f5cb", width=3)
+        if self.destination is not None:
+            goal_x = self.destination[0] / LENGTH * width
+            goal_y = self.destination[1] / SPAN * height
+            draw.ellipse((goal_x - 16, goal_y - 16, goal_x + 16, goal_y + 16),
+                         fill=(28, 168, 142, 70), outline="#77f5cb", width=3)
+            draw.ellipse((goal_x - 4, goal_y - 4, goal_x + 4, goal_y + 4), fill="#c5ffeb")
         if guides:
+            if self.route and self.spawned:
+                draw.line([(u, v), *((x / LENGTH * width, y / SPAN * height) for x, y in self.route)],
+                          fill="#77f5cb", width=3)
             for x1, y1, x2, y2 in self.boxes or ():
                 draw.rectangle((x1 / LENGTH * width, y1 / SPAN * height,
                                 x2 / LENGTH * width, y2 / SPAN * height),
@@ -175,11 +243,12 @@ class OverlayWalker:
         if guides:
             boundary = [tuple(corner) for corner in table.corners]
             ImageDraw.Draw(result).line([*boundary, boundary[0]], fill="#71dfbe", width=2)
-        avatar = self.render_avatar()
+        avatar = self.render_avatar() if self.spawned else None
         if avatar is not None:
             ground = table.image_point(u, v)
             local_scale = np.linalg.norm(table.image_point(u + width / LENGTH, v) - ground)
-            scale = np.clip(local_scale, 22, 85) / self.sprite_pixels_per_unit
+            frame_scale = frame.width / width
+            scale = np.clip(local_scale, 22 * frame_scale, 85 * frame_scale) / self.sprite_pixels_per_unit
             avatar_height = max(1, round(avatar.height * scale))
             avatar_width = max(1, round(avatar.width * scale))
             avatar = avatar.resize((avatar_width, avatar_height), Image.Resampling.LANCZOS)
@@ -211,48 +280,137 @@ def show_live(args):
 
     root = tk.Tk()
     root.title("Tabletop Walker")
-    root.configure(bg="#10171c")
-    root.resizable(False, False)
-    header = tk.Frame(root, bg="#10171c", padx=15, pady=10)
+    background, panel, ink, accent = "#10171c", "#172228", "#eef5f5", "#8af0cc"
+    root.configure(bg=background)
+    root.minsize(700, 500)
+    width = min(1180, round(root.winfo_screenwidth() * 0.88))
+    height = min(820, round(root.winfo_screenheight() * 0.86))
+    root.geometry(f"{width}x{height}")
+    header = tk.Frame(root, bg=background, padx=22, pady=15)
     header.pack(fill="x")
-    tk.Label(header, text="Tabletop Walker", font=("Segoe UI", 14, "bold"),
-             bg="#10171c", fg="#eef5f5").pack(side="left")
+    tk.Label(header, text="Tabletop Walker", font=("Segoe UI", 19, "bold"),
+             bg=background, fg=ink).pack(side="left")
     guides = tk.BooleanVar(value=False)
-    tk.Checkbutton(header, text="Show guides", variable=guides, font=("Segoe UI", 10),
-                   bg="#10171c", fg="#c0d0d3", activebackground="#10171c",
-                   activeforeground="#eef5f5", selectcolor="#263940",
-                   highlightthickness=0).pack(side="right")
-    root.bind("<d>", lambda _: guides.set(not guides.get()))
-    picture = tk.Label(root, bg="#10171c", bd=0, highlightthickness=0)
-    picture.pack()
-    status = tk.StringVar(value="Opening webcam…")
-    tk.Label(root, textvariable=status, bg="#10171c", fg="#b4c9cc",
-             font=("Segoe UI", 10), anchor="w", justify="left",
-             wraplength=610, padx=15, pady=10).pack(fill="x")
+    fullscreen = tk.BooleanVar(value=False)
+
+    def toggle_fullscreen(event=None):
+        fullscreen.set(not fullscreen.get())
+        root.attributes("-fullscreen", fullscreen.get())
+
+    tk.Button(header, text="Fullscreen  F11", command=toggle_fullscreen,
+              font=("Segoe UI", 10), bg=panel, fg=ink, relief="flat", padx=10,
+              activebackground="#263940", activeforeground=ink).pack(side="right")
+    tk.Checkbutton(header, text="Guides  D", variable=guides, font=("Segoe UI", 10),
+                   bg=panel, fg=ink, activebackground="#263940",
+                   activeforeground=ink, selectcolor=panel, highlightthickness=0,
+                   padx=9).pack(side="right", padx=(0, 10))
+    root.bind("<KeyPress-d>", lambda _: guides.set(not guides.get()))
+    root.bind("<F11>", toggle_fullscreen)
+    root.bind("<Escape>", lambda _: toggle_fullscreen() if fullscreen.get() else None)
+
+    status = tk.StringVar(value="Loading walker")
+    learning_status = tk.StringVar(value="Starting practice")
+    footer = tk.Frame(root, bg=background, padx=22, pady=13)
+    footer.pack(side="bottom", fill="x")
+    tk.Label(footer, textvariable=learning_status, bg=background, fg=accent,
+             font=("Segoe UI", 10), anchor="e").pack(side="right")
+    status_label = tk.Label(footer, textvariable=status, bg=background, fg="#c2d7d8",
+                            font=("Segoe UI", 11), anchor="w", justify="left", wraplength=500)
+    status_label.pack(side="left", fill="x", expand=True, padx=(0, 10))
+    picture = tk.Canvas(root, bg="#0a1013", bd=0, highlightthickness=1,
+                        highlightbackground="#263940", cursor="crosshair")
+    picture.pack(fill="both", expand=True, padx=20)
+    frame_item = picture.create_image(0, 0, anchor="nw")
+    footer.bind("<Configure>", lambda event: status_label.configure(wraplength=max(250, event.width - 325)))
     root.update_idletasks()
-    webcam = None
-    if not args.live_sample:
-        try:
-            webcam = Webcam(args.camera)
-        except OSError as error:
-            status.set(f"Could not start FFmpeg: {error}. Use --live-sample to rehearse.")
-            root.mainloop()
-            return
-    walker = None
+
+    webcam = walker = learner = None
     try:
         walker = OverlayWalker(args.checkpoint)
+        settings = SETTINGS[0]
+        try:
+            learner = NavigationLearning(args.checkpoint)
+            learner.start()
+        except (OSError, sqlite3.Error):
+            learning_status.set("Practice unavailable")
+
+        def update_learning():
+            nonlocal settings
+            if learner is None:
+                return
+            try:
+                settings, attempts = learner.summary()
+            except sqlite3.Error:
+                learning_status.set("Practice data unavailable")
+            else:
+                activity = "Practicing" if learner.worker.is_alive() else "Learned settings"
+                if learner.error:
+                    activity = "Practice interrupted"
+                learning_status.set(f"{activity}  /  {settings.name}  /  {attempts} trials")
+            root.after(1000, update_learning)
+
+        update_learning()
+        if not args.live_sample:
+            status.set("Opening webcam")
+            try:
+                webcam = Webcam(args.camera)
+            except OSError as error:
+                status.set(f"Could not start FFmpeg. {error}")
+                root.mainloop()
+                return
         started = time.monotonic()
+        last_tick = started
+        remaining_time = 0.0
         next_scan = 0
         table = None
-        candidate = None
+        tracker = TableTracker()
+        video_view = None
+        notice = None
+        notice_until = 0
+
+        def select_point(event):
+            nonlocal notice, notice_until
+            try:
+                if table is None or video_view is None:
+                    raise ValueError("Wait for the tabletop to be detected.")
+                left, top, scale_x, scale_y = video_view
+                destination = table.world_point((event.x - left) / scale_x, (event.y - top) / scale_y)
+                walker.choose_destination(destination, settings)
+                notice = None
+            except ValueError as error:
+                notice = str(error)
+                notice_until = time.monotonic() + 3
+
+        picture.bind("<Button-1>", select_point)
+
+        def show_frame(output):
+            nonlocal video_view
+            canvas_width, canvas_height = picture.winfo_width(), picture.winfo_height()
+            scale = min(canvas_width / output.width, canvas_height / output.height)
+            size = (max(1, round(output.width * scale)), max(1, round(output.height * scale)))
+            left, top = (canvas_width - size[0]) // 2, (canvas_height - size[1]) // 2
+            picture.image = ImageTk.PhotoImage(output.resize(size, Image.Resampling.BILINEAR))
+            picture.coords(frame_item, left, top)
+            picture.itemconfigure(frame_item, image=picture.image)
+            video_view = (left, top, size[0] / output.width, size[1] / output.height)
+
+        def scan_table(frame):
+            nonlocal table
+            table = tracker.update(frame)
+            if table is not None:
+                boxes = table.obstacles(frame, args.threshold)
+                boxes = [tuple(round(value, 1) for value in box) for box in boxes]
+                walker.replan(boxes)
 
         def tick():
-            nonlocal next_scan, table, candidate
+            nonlocal last_tick, next_scan, remaining_time
             now = time.monotonic()
+            elapsed = min(now - last_tick, 0.12)
+            last_tick = now
             if webcam is None:
                 frame = sample_feed(now - started)
             elif webcam.process.poll() is not None:
-                status.set(f"Could not stream {args.camera}. Close other camera apps and check Windows camera access.\n{webcam.error()}")
+                status.set(f"Could not stream {args.camera}. Check Windows camera access.\n{webcam.error()}")
                 return
             elif not webcam.frames:
                 if now - started > 12:
@@ -263,34 +421,30 @@ def show_live(args):
             else:
                 frame = webcam.frames[-1]
             if now >= next_scan:
-                corners = find_table(frame)
-                if corners is None:
-                    table = candidate = None
-                elif table is not None and np.max(np.abs(corners - table.corners)) < 32:
-                    table = TablePlane(0.70 * table.corners + 0.30 * corners)
-                elif candidate is not None and np.max(np.abs(corners - candidate)) < 24:
-                    table = TablePlane((corners + candidate) / 2)
-                    walker.reset()
-                    candidate = None
-                else:
-                    table, candidate = None, corners
-                if table is not None:
-                    if walker.goal_time is not None and now - walker.goal_time > 2:
-                        walker.reset()
-                    boxes = table.obstacles(frame, args.threshold)
-                    boxes = [tuple(round(value, 1) for value in box) for box in boxes]
-                    if boxes != walker.boxes and walker.goal_time is None:
-                        walker.replan(boxes)
+                scan_table(frame)
                 next_scan = now + 0.18
             if table is None:
-                status.set("Looking for the white tabletop. Keep its edges visible.")
+                remaining_time = 0.0
+                status.set("Table out of view. Trip paused" if walker.destination is not None else
+                           "Looking for the white tabletop. Keep its edges visible.")
                 output = frame
             else:
-                movement = walker.advance(2)
-                status.set(f"Table locked · {len(walker.boxes or [])} obstacles · {movement}")
+                remaining_time += elapsed
+                steps = int(remaining_time / walker.sim.dt)
+                remaining_time -= steps * walker.sim.dt
+                movement = walker.advance(steps)
+                if walker.outcome is not None:
+                    setting, reached, elapsed, distance = walker.outcome
+                    if learner is not None:
+                        try:
+                            learner.record(setting, "live", reached, elapsed, distance)
+                        except sqlite3.Error:
+                            learning_status.set("Could not save the last trip")
+                    walker.outcome = None
+                status.set(notice if notice and now < notice_until else
+                           f"{movement}  /  {len(walker.boxes)} detected objects")
                 output = walker.composite(frame, table, guides.get())
-            picture.image = ImageTk.PhotoImage(output)
-            picture.configure(image=picture.image)
+            show_frame(output)
             elapsed_ms = round((time.monotonic() - now) * 1000)
             root.after(max(1, 33 - elapsed_ms), tick)
 
@@ -299,5 +453,7 @@ def show_live(args):
     finally:
         if webcam is not None:
             webcam.close()
+        if learner is not None:
+            learner.close()
         if walker is not None:
             walker.close()

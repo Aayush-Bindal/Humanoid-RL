@@ -7,7 +7,11 @@ uv sync --locked
 uv run python tabletop_demo.py
 ```
 
-Point the webcam toward a white tabletop with its far edge and at least one side in view. The humanoid starts walking once it finds a route across the table. Move an object and the app replans. The walker pauses if the route is blocked or the table leaves view. Select **Show guides** or press **D** to see the detected tabletop outline and obstacle boxes.
+Point the webcam toward a white tabletop with its far edge and at least one side in view. When the robot appears, click a clear spot on the table to send it there. Click another spot to change the destination. The walker replans when objects block its route. If the table leaves view, the trip pauses and resumes from the same position when the tabletop is detected again.
+
+Resize the window or press **F11** for fullscreen. Press **Esc** to exit fullscreen. Turn on **Guides** with **D** to see the detected tabletop, obstacle boxes, and planned route.
+
+Each launch runs a background MuJoCo practice course. The app compares walking speeds and obstacle margins on the same course, then picks settings using the saved scores and completed live trips. Results persist in `runs/navigation-learning.sqlite3`. The footer shows the selected settings and trial count. This adapts navigation while the existing PPO checkpoint continues to control the joints. Allow the practice trials to finish before closing if you want that run to count.
 
 For a different webcam, list Windows camera names with `ffmpeg -hide_banner -list_devices true -f dshow -i dummy` and pass its name with `--camera "Camera Name"`.
 

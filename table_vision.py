@@ -1,9 +1,10 @@
 """Find the white tabletop, then detect obstacles in its rectified plane."""
 
+from collections import deque
 import numpy as np
 from PIL import Image, ImageFilter
 
-from tabletop_demo import HEIGHT, WIDTH, obstacle_boxes
+from tabletop_demo import HEIGHT, LENGTH, SPAN, WIDTH, obstacle_boxes
 
 
 TABLE_SIZE = (640, 400)
@@ -118,10 +119,34 @@ class TablePlane:
         return layer.transform(size, Image.Transform.PERSPECTIVE, self.projection,
                                resample=Image.Resampling.BILINEAR)
 
+    def visible_in(self, frame):
+        """Check whether the locked plane still covers a mostly white surface."""
+        width, height = TABLE_SIZE
+        crop = (self.image_point(40, 40), self.image_point(width - 40, 40),
+                self.image_point(width - 40, height - 40), self.image_point(40, height - 40))
+        samples = np.asarray(frame.transform((24, 16), Image.Transform.QUAD,
+                            (*crop[0], *crop[3], *crop[2], *crop[1])), dtype=np.int16)
+        white = (samples.min(axis=2) >= 128) & (np.ptp(samples, axis=2) < 51)
+        return white.mean() >= 0.68 and white[-4:].mean() >= 0.60
+
     def image_point(self, x, y):
         """Map a point in rectified tabletop pixels to its webcam position."""
-        a, b, c, d, e, f, g, h = self.rectification
+        return self.map_point(self.rectification, x, y)
+
+    def world_point(self, x, y):
+        """Convert a click in webcam pixels to a point on the walking plane."""
+        u, v = self.map_point(self.projection, x, y)
+        width, height = TABLE_SIZE
+        if not (0 <= u <= width and 0 <= v <= height):
+            raise ValueError("Click inside the detected tabletop.")
+        return (u / width * LENGTH, v / height * SPAN)
+
+    @staticmethod
+    def map_point(transform, x, y):
+        a, b, c, d, e, f, g, h = transform
         divisor = g * x + h * y + 1
+        if abs(divisor) < 1e-8:
+            raise ValueError("Point is outside the table projection.")
         return np.array([(a * x + b * y + c) / divisor, (d * x + e * y + f) / divisor])
 
     def obstacles(self, frame, threshold):
@@ -141,3 +166,39 @@ class TablePlane:
         mask[:5, :] = mask[-5:, :] = False
         mask[:, :5] = mask[:, -5:] = False
         return obstacle_boxes(mask)
+
+
+class TableTracker:
+    """Keep a walking plane anchored when a fit changes due to occlusion."""
+
+    def __init__(self):
+        self.plane = None
+        self.pending = deque(maxlen=3)
+        self.misses = 0
+
+    def update(self, frame):
+        corners = find_table(frame)
+        scale = frame.width / TABLE_SIZE[0]
+        supported = self.plane is not None and self.plane.visible_in(frame)
+        if corners is None:
+            self.pending.clear()
+            self.misses += 1
+            return self.plane if supported and self.misses <= 3 else None
+
+        self.misses = 0
+        # A new fit can pick up nearby white objects or lose the far edge.
+        # Keep the established map while its interior still shows the table.
+        if supported:
+            self.pending.clear()
+            return self.plane
+
+        if self.pending and np.max(np.abs(corners - self.pending[-1])) > 22 * scale:
+            self.pending.clear()
+        self.pending.append(corners)
+        if len(self.pending) == self.pending.maxlen:
+            candidate = TablePlane(np.median(self.pending, axis=0))
+            self.pending.clear()
+            if candidate.visible_in(frame):
+                self.plane = candidate
+                return self.plane
+        return self.plane if supported else None
