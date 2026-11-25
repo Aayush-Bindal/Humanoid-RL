@@ -15,7 +15,18 @@ Resize the window or press **F11** for fullscreen. Press **Esc** to exit fullscr
 
 Use the **Policy** dropdown to switch between **Realistic walk**, the default fine-tuned PPO checkpoint with a foot-planting animation, and **Original**, the baseline PPO checkpoint with the raw simulated pose. Switching keeps the robot in place and clears its destination. Click a new destination to resume walking. Pass `--raw-gait` to see the raw simulated pose with Realistic walk.
 
-For a different webcam, list Windows camera names with `ffmpeg -hide_banner -list_devices true -f dshow -i dummy` and pass its name with `--camera "Camera Name"`.
+## Choose a webcam
+
+Live mode starts on **cam0**. Use the **Camera** dropdown next to **Policy** to switch to another webcam. Switching clears the current destination and detects the tabletop again from the new feed. Cameras are listed at startup, so connect your external webcam before launching.
+
+To list cameras or choose which feed opens at startup:
+
+```powershell
+uv run python tabletop_demo.py --list-cameras
+uv run python tabletop_demo.py --camera cam1
+```
+
+Both `--camera cam1` and `--camera 1` work, as does `--camera "Camera Name"`. Windows can change the numbering when you plug in or unplug cameras. Use the command-line option to select a camera for `--snapshot`.
 
 Rehearse the live overlay with a generated feed and a moving obstacle.
 
