@@ -5,3 +5,6 @@ __pycache__/
 !/runs/baseline-seed0/
 /runs/baseline-seed0/*
 !/runs/baseline-seed0/policy.zip
+!/runs/experimental-gait/
+/runs/experimental-gait/*
+!/runs/experimental-gait/policy.zip

@@ -14,9 +14,11 @@ from PIL import Image, ImageDraw, ImageFilter
 from stable_baselines3 import PPO
 from torch import set_num_threads
 
+from avatar_gait import AvatarGait, project_ground
+from gait_support import PHASE_FEATURES, walking_observation
 from navigation_learning import NavigationLearning, SETTINGS
 from table_vision import TABLE_SIZE, TableTracker
-from tabletop_demo import LENGTH, SPAN, START
+from tabletop_demo import BASELINE_CHECKPOINT, LENGTH, SPAN, START, WALKING_CHECKPOINT
 from tabletop_demo import make_course, plan_route, position_clear, segment_clear, steer
 
 
@@ -91,13 +93,15 @@ class Webcam:
 
 
 class OverlayWalker:
-    def __init__(self, checkpoint):
+    def __init__(self, checkpoint, *, raw_gait=False):
         set_num_threads(1)
-        self.policy = PPO.load(checkpoint, device="cpu")
+        policy = PPO.load(checkpoint, device="cpu")
         with TemporaryDirectory() as directory:
             self.env = make_course([], [], directory, render=False, overlay=True)
         self.sim = self.env.unwrapped
         self.torso = self.sim.model.body("torso").id
+        self.gait = None
+        self.avatar_anchor = None
         try:
             self.renderer = mujoco.Renderer(self.sim.model, height=320, width=320)
         except Exception:
@@ -124,6 +128,33 @@ class OverlayWalker:
             else:
                 geom.rgba[:] = (0.78, 0.83, 0.85, 1)
         self.reset()
+        self.set_policy(policy, raw_gait=raw_gait)
+
+    def set_policy(self, policy, *, raw_gait):
+        lower_lift = getattr(policy, "gait_lower_lift", False)
+        phase_gait = getattr(policy, "gait_phase_inputs", False)
+        pace_scale = getattr(policy, "gait_pace_scale", 1.0)
+        observation_size = self.sim.observation_space.shape[0]
+        if phase_gait:
+            observation_size += PHASE_FEATURES
+        if (policy.observation_space.shape != (observation_size,)
+                or policy.action_space.shape != self.sim.action_space.shape):
+            raise ValueError("This checkpoint uses a different humanoid model.")
+
+        gait = None if raw_gait else AvatarGait(self.sim.model)
+        position = self.sim.data.qpos[:2].copy() if self.spawned else None
+        self.policy = policy
+        self.lower_lift = lower_lift
+        self.phase_gait = phase_gait
+        self.pace_scale = pace_scale
+        self.gait = gait
+        self.avatar_anchor = None
+        self.route.clear()
+        self.destination = None
+        self.outcome = None
+        self.elapsed = self.distance = 0
+        if position is not None:
+            self.place_robot(position)
 
     def reset(self):
         self.route = deque()
@@ -154,6 +185,8 @@ class OverlayWalker:
         qpos = self.sim.data.qpos.copy()
         qpos[:2] = position
         self.sim.set_state(qpos, np.zeros(self.sim.model.nv))
+        if self.gait is not None:
+            self.gait.reset(self.sim.data.qpos[:2])
         self.spawned = True
         self.status = "Click a clear spot on the table"
 
@@ -246,6 +279,8 @@ class OverlayWalker:
         qvel = self.sim.data.qvel.copy()
         qvel[:2] = 0
         self.sim.set_state(qpos, qvel)
+        if self.gait is not None:
+            self.gait.reset(qpos[:2], self.gait.yaw)
         self.destination = destination
         self.route.clear()
 
@@ -280,17 +315,22 @@ class OverlayWalker:
         return self.status
 
     def advance(self, steps):
-        if not self.route:
-            return self.status
         for _ in range(steps):
             position = self.sim.data.qpos[:2]
+            if not self.route:
+                if self.gait is not None and self.spawned:
+                    self.gait.step(position, self.sim.dt, update_pose=False)
+                continue
             if np.linalg.norm(np.asarray(self.route[0]) - position) < 0.18:
                 self.route.popleft()
                 if not self.route:
                     return self.finish(True, "Arrived")
             delta = np.asarray(self.route[0]) - position
-            steer(self.sim, self.torso, delta, max_speed=self.settings.speed)
-            action, _ = self.policy.predict(self.sim._get_obs(), deterministic=True)
+            speed = self.settings.speed * self.pace_scale
+            steer(self.sim, self.torso, delta, max_speed=speed,
+                  lower_lift=self.lower_lift, phase_gait=self.phase_gait)
+            observation = walking_observation(self.sim, self.torso, delta, speed, self.phase_gait)
+            action, _ = self.policy.predict(observation, deterministic=True)
             previous_pose = self.sim.data.qpos.copy()
             _, _, fell, _, _ = self.sim.step(action)
             self.elapsed += self.sim.dt
@@ -301,6 +341,8 @@ class OverlayWalker:
             if not position_clear(self.sim.data.qpos[:2], self.boxes, clearance=STOP_CLEARANCE):
                 self.sim.set_state(previous_pose, np.zeros(self.sim.model.nv))
                 return self.finish(False, "Stopped near an obstacle. Choose another spot")
+            if self.gait is not None:
+                self.gait.step(self.sim.data.qpos[:2], self.sim.dt, self.route[0], update_pose=False)
             if self.elapsed >= 27:
                 return self.finish(False, "Trip timed out. Choose another spot")
         return self.status
@@ -309,7 +351,10 @@ class OverlayWalker:
         """Render the pose as a transparent image with its natural proportions."""
         x, y = self.sim.data.qpos[:2]
         self.camera.lookat[:] = (x, y, 0.78)
-        self.renderer.update_scene(self.sim.data, camera=self.camera,
+        if self.gait is not None:
+            self.gait.refresh_pose()
+        pose = self.gait.pose if self.gait is not None else self.sim.data
+        self.renderer.update_scene(pose, camera=self.camera,
                                    scene_option=self.scene_options)
         rgb = self.renderer.render()
         self.renderer.enable_segmentation_rendering()
@@ -320,6 +365,9 @@ class OverlayWalker:
         alpha = (objects[:, :, 1] == mujoco.mjtObj.mjOBJ_GEOM).astype(np.uint8) * 255
         avatar = Image.fromarray(np.dstack((rgb, alpha)))
         bounds = avatar.getbbox()
+        if bounds and self.gait is not None:
+            sx, sy = project_ground(self.renderer, self.sim.model, (x, y))
+            self.avatar_anchor = (sx - bounds[0], sy - bounds[1])
         return avatar.crop(bounds) if bounds else None
 
     def composite(self, frame, table, guides=False):
@@ -360,9 +408,14 @@ class OverlayWalker:
             scale = np.clip(local_scale, 22 * frame_scale, 85 * frame_scale) / self.sprite_pixels_per_unit
             avatar_height = max(1, round(avatar.height * scale))
             avatar_width = max(1, round(avatar.width * scale))
+            if self.avatar_anchor is None:
+                anchor_x, anchor_y = avatar_width / 2, avatar_height - 2
+            else:
+                anchor_x = self.avatar_anchor[0] * avatar_width / avatar.width
+                anchor_y = self.avatar_anchor[1] * avatar_height / avatar.height
             avatar = avatar.resize((avatar_width, avatar_height), Image.Resampling.LANCZOS)
-            result.alpha_composite(avatar, (round(ground[0] - avatar_width / 2),
-                                           round(ground[1] - avatar_height + 2)))
+            result.alpha_composite(avatar, (round(ground[0] - anchor_x),
+                                           round(ground[1] - anchor_y)))
         return result
 
     def close(self):
@@ -385,6 +438,7 @@ def sample_feed(seconds):
 
 def show_live(args):
     import tkinter as tk
+    from tkinter import ttk
     from PIL import ImageTk
 
     root = tk.Tk()
@@ -413,6 +467,22 @@ def show_live(args):
                    bg=panel, fg=ink, activebackground="#263940",
                    activeforeground=ink, selectcolor=panel, highlightthickness=0,
                    padx=9).pack(side="right", padx=(0, 10))
+    choices = {
+        "Realistic walk": (WALKING_CHECKPOINT, args.raw_gait),
+        "Original": (BASELINE_CHECKPOINT, True),
+    }
+    initial_label = next((label for label, (checkpoint, _) in choices.items()
+                          if checkpoint == args.checkpoint.resolve()), "Custom")
+    if initial_label == "Custom":
+        choices[initial_label] = (args.checkpoint.resolve(), args.raw_gait)
+    policy_control = tk.Frame(header, bg=background)
+    policy_control.pack(side="right", padx=(0, 15))
+    tk.Label(policy_control, text="Policy", font=("Segoe UI", 10), bg=background,
+             fg=ink).pack(side="left", padx=(0, 6))
+    selected_policy = tk.StringVar(value=initial_label)
+    policy_selector = ttk.Combobox(policy_control, values=tuple(choices), width=15,
+                                   textvariable=selected_policy, state="readonly")
+    policy_selector.pack(side="left")
     root.bind("<KeyPress-d>", lambda _: guides.set(not guides.get()))
     root.bind("<F11>", toggle_fullscreen)
     root.bind("<Escape>", lambda _: toggle_fullscreen() if fullscreen.get() else None)
@@ -435,16 +505,31 @@ def show_live(args):
 
     webcam = walker = learner = None
     try:
-        walker = OverlayWalker(args.checkpoint)
+        active_label = initial_label
+        checkpoint, raw_gait = choices[active_label]
+        walker = OverlayWalker(checkpoint, raw_gait=raw_gait)
         settings = SETTINGS[0]
-        try:
-            learner = NavigationLearning(args.checkpoint)
-            learner.start()
-        except (OSError, sqlite3.Error):
-            learning_status.set("Practice unavailable")
+
+        def start_practice(checkpoint):
+            nonlocal learner, settings
+            if learner is not None:
+                learner.close()
+                learner = None
+            settings = SETTINGS[0]
+            try:
+                learner = NavigationLearning(checkpoint)
+                learner.start()
+            except (OSError, sqlite3.Error):
+                learner = None
+                learning_status.set("Practice unavailable")
+            else:
+                learning_status.set("Starting practice")
+
+        start_practice(checkpoint)
 
         def update_learning():
             nonlocal settings
+            root.after(1000, update_learning)
             if learner is None:
                 return
             try:
@@ -456,7 +541,6 @@ def show_live(args):
                 if learner.error:
                     activity = "Practice interrupted"
                 learning_status.set(f"{activity}  /  {settings.name}  /  {attempts} trials")
-            root.after(1000, update_learning)
 
         update_learning()
         if not args.live_sample:
@@ -477,6 +561,28 @@ def show_live(args):
         notice = None
         notice_until = 0
         tap_feedback = None
+
+        def switch_policy(_event):
+            nonlocal active_label, notice, notice_until, remaining_time, tap_feedback
+            label = selected_policy.get()
+            if label == active_label:
+                return
+            path, raw_gait = choices[label]
+            try:
+                policy = PPO.load(path, device="cpu")
+                walker.set_policy(policy, raw_gait=raw_gait)
+            except Exception as error:
+                selected_policy.set(active_label)
+                notice = f"Could not load {label}. {error}"
+            else:
+                active_label = label
+                start_practice(path)
+                remaining_time = 0.0
+                notice = f"{label} selected. Click a destination to walk."
+            tap_feedback = None
+            notice_until = time.monotonic() + 3
+
+        policy_selector.bind("<<ComboboxSelected>>", switch_policy)
 
         def select_point(event):
             nonlocal notice, notice_until, tap_feedback

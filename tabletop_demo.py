@@ -24,11 +24,15 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFilter
 from stable_baselines3 import PPO
 
+from gait_support import limit_vertical_assistance, walking_observation
+
 
 WIDTH, HEIGHT = 320, 200
 LENGTH, SPAN = 8.0, 5.0
 START, GOAL = (0.8, 2.5), (7.2, 2.5)
 CLEARANCE = 0.85
+BASELINE_CHECKPOINT = Path(__file__).resolve().parent / "runs/baseline-seed0/policy.zip"
+WALKING_CHECKPOINT = Path(__file__).resolve().parent / "runs/experimental-gait/policy.zip"
 
 
 def capture(camera):
@@ -232,7 +236,7 @@ def make_course(boxes, route, directory, render, overlay=False):
                                            "elevation": -54, "lookat": np.array([4.0, 2.5, 0.2])})
 
 
-def steer(sim, torso, delta, max_speed=1.0):
+def steer(sim, torso, delta, max_speed=1.0, *, lower_lift=False, phase_gait=False):
     """Apply the virtual harness forces for one policy step."""
     distance = np.linalg.norm(delta)
     if distance < 1e-8:
@@ -248,6 +252,8 @@ def steer(sim, torso, delta, max_speed=1.0):
     wrench = sim.data.xfrc_applied[torso]
     wrench[:2] = np.clip(180 * (desired_velocity - sim.data.qvel[:2]), -190, 190)
     wrench[2] = np.clip(4200 * (1.38 - sim.data.qpos[2]) - 330 * sim.data.qvel[2], 0, 450)
+    if lower_lift or phase_gait:
+        limit_vertical_assistance(sim, torso, phase_gait)
     wrench[3:] = np.cross(rotation[:, 2], [0, 0, 1]) * 310 - 27 * velocity[:3]
     wrench[5] += 160 * yaw_error
     wrench[3:] = np.clip(wrench[3:], -160, 160)
@@ -276,10 +282,12 @@ def walk(env, boxes, route, policy, render, *, max_speed=1.0, stop=None):
     mujoco.mj_normalizeQuat(sim.model, qpos)
     sim.set_state(qpos, np.zeros(sim.model.nv))
     # Step the unwrapped environment after initializing its state here.
-    observation = sim._get_obs()
     torso = sim.model.body("torso").id
     obstacle_ids = {sim.model.geom(f"obstacle_{i}").id for i in range(len(boxes))}
     target_index = 1
+    lower_lift = getattr(policy, "gait_lower_lift", False)
+    phase_gait = getattr(policy, "gait_phase_inputs", False)
+    max_speed *= getattr(policy, "gait_pace_scale", 1.0)
     for step in range(1800):
         if stop is not None and stop.is_set():
             return False, "Practice stopped."
@@ -293,9 +301,11 @@ def walk(env, boxes, route, policy, render, *, max_speed=1.0, stop=None):
                 return True, f"Reached goal in {step * sim.dt:.1f} simulated seconds with zero obstacle contacts."
             target_index += 1
             target = np.asarray(route[target_index])
-        steer(sim, torso, target - position, max_speed=max_speed)
+        delta = target - position
+        steer(sim, torso, delta, max_speed=max_speed, lower_lift=lower_lift, phase_gait=phase_gait)
+        observation = walking_observation(sim, torso, delta, max_speed, phase_gait)
         action, _ = policy.predict(observation, deterministic=True)
-        observation, _, fell, _, _ = sim.step(action)
+        _, _, fell, _, _ = sim.step(action)
         for contact in sim.data.contact:
             if contact.geom1 in obstacle_ids or contact.geom2 in obstacle_ids:
                 return False, "The humanoid contacted an obstacle."
@@ -485,10 +495,12 @@ def show_demo(args, frames, photo_pair=False):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--checkpoint", type=Path, default=Path("runs/baseline-seed0/policy.zip"))
+    parser.add_argument("--checkpoint", type=Path, default=WALKING_CHECKPOINT,
+                        help="initial policy checkpoint (default: realistic walk)")
     parser.add_argument("--camera", default="Integrated Camera", help="Windows DirectShow camera name")
     parser.add_argument("--sample", action="store_true", help="rehearse with a generated scene")
     parser.add_argument("--live-sample", action="store_true", help="rehearse the live overlay without a webcam")
+    parser.add_argument("--raw-gait", action="store_true", help="show the raw simulated pose in the live overlay")
     parser.add_argument("--snapshot", action="store_true", help="open the original capture workflow")
     parser.add_argument("--images", type=Path, nargs=2, metavar=("EMPTY", "SCENE"),
                         help="use two matching photos of the same surface instead of live capture")
