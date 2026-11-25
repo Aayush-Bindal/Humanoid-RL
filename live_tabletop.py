@@ -139,8 +139,30 @@ class OverlayWalker:
         self.distance = math.dist(origin, destination)
         self.status = "Walking to your marker"
 
-    def replan(self, boxes):
-        if self.boxes == boxes and self.spawned:
+    def remap(self, previous_table, table):
+        """Keep the robot and marker over the same spots as the plane grows."""
+        if not self.spawned:
+            return
+
+        def translate(point):
+            x, y = point
+            pixel = previous_table.image_point(x / LENGTH * VIDEO_SIZE[0], y / SPAN * VIDEO_SIZE[1])
+            return table.world_point(*pixel)
+
+        qpos = self.sim.data.qpos.copy()
+        try:
+            qpos[:2] = translate(qpos[:2])
+            destination = translate(self.destination) if self.destination is not None else None
+        except ValueError:
+            return
+        qvel = self.sim.data.qvel.copy()
+        qvel[:2] = 0
+        self.sim.set_state(qpos, qvel)
+        self.destination = destination
+        self.route.clear()
+
+    def replan(self, boxes, *, force=False):
+        if not force and self.boxes == boxes and self.spawned:
             return
         self.boxes = boxes
         if not self.spawn() or self.destination is None or self.status == "Arrived":
@@ -396,11 +418,14 @@ def show_live(args):
 
         def scan_table(frame):
             nonlocal table
+            previous_table = tracker.plane
             table = tracker.update(frame)
             if table is not None:
+                if tracker.refined:
+                    walker.remap(previous_table, table)
                 boxes = table.obstacles(frame, args.threshold)
                 boxes = [tuple(round(value, 1) for value in box) for box in boxes]
-                walker.replan(boxes)
+                walker.replan(boxes, force=tracker.refined)
 
         def tick():
             nonlocal last_tick, next_scan, remaining_time

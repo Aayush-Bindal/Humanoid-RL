@@ -49,10 +49,95 @@ def table_edge(rows, column, clipped):
     return np.polyfit(points[best, 0], points[best, 1], 1)
 
 
+def trace_upper_side(neutral, brightness, side, top):
+    """Follow the left edge upward even when objects split the white rows."""
+    recovered = []
+    last_y = top
+    for y in range(top - 1, HEIGHT // 8, -1):
+        expected = round(np.polyval(side, y))
+        matches = []
+        for x in range(max(7, expected - 6), min(WIDTH - 8, expected + 7)):
+            inside = brightness[y, x + 2:x + 8]
+            outside = brightness[y, x - 7:x - 1]
+            contrast = inside.mean() - outside.mean()
+            if neutral[y, x + 2:x + 8].sum() >= 5 and contrast >= 12:
+                matches.append((contrast, x))
+        if matches:
+            _, x = max(matches)
+            recovered.append((y, x))
+            last_y = y
+        elif last_y - y > 8:
+            break
+    return recovered
+
+
+def far_boundary(brightness, neutral, left, right, top):
+    """Find a visible cross-table edge supported by several separated columns."""
+    left_x = float(np.polyval(left, top))
+    right_x = float(np.polyval(right, top))
+    columns = np.arange(max(4, round(left_x) + 8), WIDTH - 4, 3)
+    expected_columns = (columns <= right_x).sum()
+    if len(columns) < 16:
+        return top, top, right_x
+    # Average both sides of candidate edges and ignore isolated highlights.
+    averaged = np.vstack((np.zeros(WIDTH), np.cumsum(brightness, axis=0)))
+    best_score, best_edge = 0, (top, top, right_x)
+    for y in range(max(9, top - 9), min(HEIGHT - 10, top + 9)):
+        for slope in np.arange(-0.16, 0.17, 0.025):
+            rows = np.rint(y + (columns - left_x) * slope).astype(int)
+            valid = (rows >= 6) & (rows < HEIGHT - 7)
+            row, col = rows[valid], columns[valid]
+            above = (averaged[row - 1, col] - averaged[row - 6, col]) / 5
+            below = (averaged[row + 7, col] - averaged[row + 2, col]) / 5
+            contrast = below - above
+            hits = neutral[row + 2, col] & (contrast >= 14)
+            supported = col[hits]
+            if len(supported) < max(11, expected_columns * 0.47):
+                continue
+            # Avoid carrying the boundary across a large gap into the room.
+            gaps = np.flatnonzero(np.diff(supported) > 25)
+            if len(gaps):
+                supported = supported[:gaps[0] + 1]
+            if len(supported) < 11 or supported[0] - left_x > 35:
+                continue
+            if supported[-1] - supported[0] < (right_x - left_x) * 0.55:
+                continue
+            on_edge = hits & (col <= supported[-1])
+            sharpness = brightness[row + 2, col] - brightness[row - 2, col]
+            score = (np.minimum(contrast[on_edge], 45).sum()
+                     + np.minimum(sharpness[on_edge], 55).sum()
+                     - 6 * abs(y - top))
+            if score > best_score:
+                best_score = score
+                intercept = y - left_x * slope
+                left_y = round((slope * left[1] + intercept) / (1 - slope * left[0]))
+                right_y = round((slope * right[1] + intercept) / (1 - slope * right[0]))
+                observed_right = supported[-1]
+                if observed_right > np.polyval(right, right_y) + 5:
+                    right_y = round(slope * observed_right + intercept)
+                else:
+                    observed_right = np.polyval(right, right_y)
+                best_edge = (left_y, right_y, observed_right)
+    return best_edge
+
+
+def near_right_boundary(neutral, left, right, bottom):
+    """Use white surface visible below a right-hand occluder when available."""
+    left_x = round(np.polyval(left, bottom))
+    right_x = float(np.polyval(right, bottom))
+    observations = []
+    for row in neutral[max(0, bottom - 7):bottom + 1]:
+        for start, end in white_spans(row):
+            if abs(start - left_x) <= 13 and end > right_x + 5:
+                observations.append(end)
+    return max(right_x, np.median(observations)) if len(observations) >= 4 else right_x
+
+
 def find_table(frame):
     """Locate the largest continuous white surface extending toward the camera."""
     small = frame.resize((WIDTH, HEIGHT)).filter(ImageFilter.GaussianBlur(1))
     pixels = np.asarray(small, dtype=np.int16)
+    brightness = pixels.mean(axis=2)
     neutral = (pixels.min(axis=2) >= 128) & (np.ptp(pixels, axis=2) < 51)
     spans = [white_spans(row) for row in neutral]
     seed = None
@@ -86,21 +171,29 @@ def find_table(frame):
             elif abs(y - last_y) > 5:
                 break
     top, bottom = min(row[0] for row in rows), max(row[0] for row in rows)
-    if bottom - top < HEIGHT * 0.23:
+    if bottom - top < HEIGHT * 0.09:
         return None
     if top <= HEIGHT // 8 + 6 and all(row[1] < 8 and row[2] > WIDTH - 9 for row in rows):
         return None
     left = table_edge(rows, 1, 0)
     right = table_edge(rows, 2, WIDTH - 1)
+    recovered = trace_upper_side(neutral, brightness, left, top)
+    if len(recovered) >= 5:
+        # A projected edge can extend well past a dark phone or bag that
+        # divided the upper rows into spans too small for the initial scan.
+        top = recovered[-1][0]
+    far_left, far_right, far_right_x = far_boundary(brightness, neutral, left, right, top)
+    if min(bottom - far_left, bottom - far_right) < HEIGHT * 0.23:
+        return None
     # Inset the fitted boundary to keep edge pixels and room background out.
-    top += 3
     bottom -= 3
-    corners = []
-    for y, edge, inset in ((top, left, 4), (top, right, -4),
-                           (bottom, right, -4), (bottom, left, 4)):
-        x = np.clip(np.polyval(edge, y) + inset, 3, WIDTH - 4)
-        corners.append((x, y))
-    quad = np.array(corners)
+    quad = np.array([
+        (np.polyval(left, far_left + 3) + 4, far_left + 3),
+        (far_right_x - 4, far_right + 3),
+        (near_right_boundary(neutral, left, right, bottom) - 4, bottom),
+        (np.polyval(left, bottom) + 4, bottom),
+    ])
+    quad[:, 0] = np.clip(quad[:, 0], 3, WIDTH - 4)
     if min(quad[1, 0] - quad[0, 0], quad[2, 0] - quad[3, 0]) < WIDTH * 0.21:
         return None
     quad *= np.array([frame.width / WIDTH, frame.height / HEIGHT])
@@ -175,11 +268,36 @@ class TableTracker:
         self.plane = None
         self.pending = deque(maxlen=3)
         self.misses = 0
+        self.refined = False
+
+    def extends_far_edge(self, corners, scale):
+        """Allow growth on the same tabletop, with fixed near and left edges."""
+        locked = self.plane.corners
+        if (abs(corners[3, 1] - locked[3, 1]) > 12 * scale
+                or abs(corners[3, 0] - locked[3, 0]) > 16 * scale
+                or np.mean(locked[:2, 1] - corners[:2, 1]) < 23 * scale
+                or np.min(locked[:2, 1] - corners[:2, 1]) < 12 * scale):
+            return False
+        edge = locked[3] - locked[0]
+        slope = edge[0] / edge[1]
+        expected_left = locked[0, 0] + (corners[0, 1] - locked[0, 1]) * slope
+        if abs(corners[0, 0] - expected_left) > 12 * scale:
+            return False
+        # A changed fit should add surface, rather than trade one side for another.
+        candidate = TablePlane(corners)
+        width, height = TABLE_SIZE
+        for x, y in ((35, 35), (width - 35, 35), (35, height - 35), (width - 35, height - 35)):
+            try:
+                candidate.world_point(*self.plane.image_point(x, y))
+            except ValueError:
+                return False
+        return True
 
     def update(self, frame):
         corners = find_table(frame)
         scale = frame.width / TABLE_SIZE[0]
         supported = self.plane is not None and self.plane.visible_in(frame)
+        self.refined = False
         if corners is None:
             self.pending.clear()
             self.misses += 1
@@ -188,7 +306,7 @@ class TableTracker:
         self.misses = 0
         # A new fit can pick up nearby white objects or lose the far edge.
         # Keep the established map while its interior still shows the table.
-        if supported:
+        if supported and not self.extends_far_edge(corners, scale):
             self.pending.clear()
             return self.plane
 
@@ -199,6 +317,7 @@ class TableTracker:
             candidate = TablePlane(np.median(self.pending, axis=0))
             self.pending.clear()
             if candidate.visible_in(frame):
+                self.refined = supported
                 self.plane = candidate
                 return self.plane
         return self.plane if supported else None
