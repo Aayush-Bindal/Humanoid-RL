@@ -158,7 +158,6 @@ class AvatarGait:
         self.draw_pose(*self.pose_inputs)
 
     def draw_pose(self, position, lift, speed):
-        heading = self.axes()
         reach = max(np.linalg.norm(foot - position) for foot in self.feet_xy)
         self.qpos[:3] = (*position, 1.285 - min(0.20, 0.75 * reach ** 2))
         self.qpos[3:7] = (math.cos(self.yaw / 2), 0, 0, math.sin(self.yaw / 2))
