@@ -185,10 +185,6 @@ def make_course(boxes, route, directory, render, overlay=False):
     finally:
         template.close()
     world = tree.getroot().find("worldbody")
-    if overlay:
-        # An oblique orthographic camera keeps the robot's feet aligned to the feed.
-        ET.SubElement(world, "camera", name="webcam_overlay", projection="orthographic",
-                      fovy="4.5", pos="4 -1.86 9", xyaxes="1 0 0 0 0.9 0.435889894")
     for index, (x1, y1, x2, y2) in enumerate(boxes):
         ET.SubElement(world, "geom", name=f"obstacle_{index}", type="box",
                       pos=f"{(x1 + x2) / 2} {(y1 + y2) / 2} 0.36",

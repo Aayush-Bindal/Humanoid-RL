@@ -8,7 +8,7 @@ import time
 
 import mujoco
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFilter
 from stable_baselines3 import PPO
 from torch import set_num_threads
 
@@ -70,13 +70,30 @@ class OverlayWalker:
         self.sim = self.env.unwrapped
         self.torso = self.sim.model.body("torso").id
         try:
-            self.renderer = mujoco.Renderer(self.sim.model, height=360, width=640)
+            self.renderer = mujoco.Renderer(self.sim.model, height=320, width=320)
         except Exception:
             self.env.close()
             raise
         self.scene_options = mujoco.MjvOption()
         self.sim.model.geom("floor").group = 5
         self.scene_options.geomgroup[5] = 0
+        self.camera = mujoco.MjvCamera()
+        self.camera.azimuth = 90
+        self.camera.elevation = -24
+        self.camera.distance = 3.6
+        vertical_fov = np.deg2rad(self.sim.model.vis.global_.fovy)
+        self.sprite_pixels_per_unit = self.renderer.height / (
+            2 * self.camera.distance * np.tan(vertical_fov / 2)
+        )
+        for index in range(1, self.sim.model.ngeom):
+            geom = self.sim.model.geom(index)
+            geom.matid = -1
+            if any(part in geom.name for part in ("foot", "hand", "waist", "butt")):
+                geom.rgba[:] = (0.17, 0.22, 0.26, 1)
+            elif geom.name == "head" or "shin" in geom.name:
+                geom.rgba[:] = (0.18, 0.74, 0.70, 1)
+            else:
+                geom.rgba[:] = (0.78, 0.83, 0.85, 1)
         self.reset()
 
     def reset(self):
@@ -117,8 +134,11 @@ class OverlayWalker:
                 return "Restarting"
         return "Walking · route updates as objects move"
 
-    def composite(self, frame, table):
-        self.renderer.update_scene(self.sim.data, camera="webcam_overlay",
+    def render_avatar(self):
+        """Render the pose as a transparent image with its natural proportions."""
+        x, y = self.sim.data.qpos[:2]
+        self.camera.lookat[:] = (x, y, 0.78)
+        self.renderer.update_scene(self.sim.data, camera=self.camera,
                                    scene_option=self.scene_options)
         rgb = self.renderer.render()
         self.renderer.enable_segmentation_rendering()
@@ -127,23 +147,44 @@ class OverlayWalker:
         finally:
             self.renderer.disable_segmentation_rendering()
         alpha = (objects[:, :, 1] == mujoco.mjtObj.mjOBJ_GEOM).astype(np.uint8) * 255
-        overlay = Image.fromarray(np.dstack((rgb, alpha)))
-        overlay = overlay.transpose(Image.Transpose.FLIP_TOP_BOTTOM).resize(VIDEO_SIZE)
+        avatar = Image.fromarray(np.dstack((rgb, alpha)))
+        bounds = avatar.getbbox()
+        return avatar.crop(bounds) if bounds else None
+
+    def composite(self, frame, table, guides=False):
+        """Project ground marks, then place the upright avatar at its ground point."""
+        width, height = VIDEO_SIZE
+        x, y = self.sim.data.qpos[:2]
+        u, v = x / LENGTH * width, y / SPAN * height
         layer = Image.new("RGBA", VIDEO_SIZE)
         draw = ImageDraw.Draw(layer)
-        for x1, y1, x2, y2 in self.boxes or ():
-            draw.rectangle((x1 / LENGTH * VIDEO_SIZE[0], y1 / SPAN * VIDEO_SIZE[1],
-                            x2 / LENGTH * VIDEO_SIZE[0], y2 / SPAN * VIDEO_SIZE[1]),
-                           fill=(243, 161, 76, 24), outline=(243, 161, 76, 215), width=3)
-        x = round(GOAL[0] / LENGTH * VIDEO_SIZE[0])
-        y = round(GOAL[1] / SPAN * VIDEO_SIZE[1])
-        draw.ellipse((x - 9, y - 6, x + 9, y + 6),
-                     fill="#47c97a", outline="white", width=2)
-        layer.alpha_composite(overlay)
+        draw.ellipse((u - 18, v - 11, u + 18, v + 11), fill=(7, 16, 20, 105))
+        layer = layer.filter(ImageFilter.GaussianBlur(5))
+        draw = ImageDraw.Draw(layer)
+        goal_x = GOAL[0] / LENGTH * width
+        goal_y = GOAL[1] / SPAN * height
+        draw.ellipse((goal_x - 13, goal_y - 11, goal_x + 13, goal_y + 11),
+                     fill=(28, 168, 142, 90), outline="#77f5cb", width=3)
+        if guides:
+            for x1, y1, x2, y2 in self.boxes or ():
+                draw.rectangle((x1 / LENGTH * width, y1 / SPAN * height,
+                                x2 / LENGTH * width, y2 / SPAN * height),
+                               fill=(243, 161, 76, 24), outline=(243, 161, 76, 215), width=3)
         result = frame.convert("RGBA")
         result.alpha_composite(table.project(layer, frame.size))
-        boundary = [tuple(corner) for corner in table.corners]
-        ImageDraw.Draw(result).line([*boundary, boundary[0]], fill="#71dfbe", width=2)
+        if guides:
+            boundary = [tuple(corner) for corner in table.corners]
+            ImageDraw.Draw(result).line([*boundary, boundary[0]], fill="#71dfbe", width=2)
+        avatar = self.render_avatar()
+        if avatar is not None:
+            ground = table.image_point(u, v)
+            local_scale = np.linalg.norm(table.image_point(u + width / LENGTH, v) - ground)
+            scale = np.clip(local_scale, 22, 85) / self.sprite_pixels_per_unit
+            avatar_height = max(1, round(avatar.height * scale))
+            avatar_width = max(1, round(avatar.width * scale))
+            avatar = avatar.resize((avatar_width, avatar_height), Image.Resampling.LANCZOS)
+            result.alpha_composite(avatar, (round(ground[0] - avatar_width / 2),
+                                           round(ground[1] - avatar_height + 2)))
         return result
 
     def close(self):
@@ -166,15 +207,28 @@ def sample_feed(seconds):
 
 def show_live(args):
     import tkinter as tk
-    from tkinter import ttk
     from PIL import ImageTk
 
     root = tk.Tk()
-    root.title("Live Humanoid")
-    picture = ttk.Label(root)
+    root.title("Tabletop Walker")
+    root.configure(bg="#10171c")
+    root.resizable(False, False)
+    header = tk.Frame(root, bg="#10171c", padx=15, pady=10)
+    header.pack(fill="x")
+    tk.Label(header, text="Tabletop Walker", font=("Segoe UI", 14, "bold"),
+             bg="#10171c", fg="#eef5f5").pack(side="left")
+    guides = tk.BooleanVar(value=False)
+    tk.Checkbutton(header, text="Show guides", variable=guides, font=("Segoe UI", 10),
+                   bg="#10171c", fg="#c0d0d3", activebackground="#10171c",
+                   activeforeground="#eef5f5", selectcolor="#263940",
+                   highlightthickness=0).pack(side="right")
+    root.bind("<d>", lambda _: guides.set(not guides.get()))
+    picture = tk.Label(root, bg="#10171c", bd=0, highlightthickness=0)
     picture.pack()
     status = tk.StringVar(value="Opening webcam…")
-    ttk.Label(root, textvariable=status, wraplength=620, padding=10).pack(fill="x")
+    tk.Label(root, textvariable=status, bg="#10171c", fg="#b4c9cc",
+             font=("Segoe UI", 10), anchor="w", justify="left",
+             wraplength=610, padx=15, pady=10).pack(fill="x")
     root.update_idletasks()
     webcam = None
     if not args.live_sample:
@@ -234,7 +288,7 @@ def show_live(args):
             else:
                 movement = walker.advance(2)
                 status.set(f"Table locked · {len(walker.boxes or [])} obstacles · {movement}")
-                output = walker.composite(frame, table)
+                output = walker.composite(frame, table, guides.get())
             picture.image = ImageTk.PhotoImage(output)
             picture.configure(image=picture.image)
             elapsed_ms = round((time.monotonic() - now) * 1000)

@@ -118,6 +118,12 @@ class TablePlane:
         return layer.transform(size, Image.Transform.PERSPECTIVE, self.projection,
                                resample=Image.Resampling.BILINEAR)
 
+    def image_point(self, x, y):
+        """Map a point in rectified tabletop pixels to its webcam position."""
+        a, b, c, d, e, f, g, h = self.rectification
+        divisor = g * x + h * y + 1
+        return np.array([(a * x + b * y + c) / divisor, (d * x + e * y + f) / divisor])
+
     def obstacles(self, frame, threshold):
         rectified = frame.transform(TABLE_SIZE, Image.Transform.PERSPECTIVE, self.rectification,
                                     resample=Image.Resampling.BILINEAR)

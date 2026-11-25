@@ -7,7 +7,7 @@ uv sync --locked
 uv run python tabletop_demo.py
 ```
 
-Point the webcam toward a white tabletop with its far edge and at least one side in view. The app outlines the tabletop in mint and marks detected objects in orange. The humanoid starts walking once it finds a route across the table. Move an object and the app replans. The walker pauses if the route is blocked or the table leaves view.
+Point the webcam toward a white tabletop with its far edge and at least one side in view. The humanoid starts walking once it finds a route across the table. Move an object and the app replans. The walker pauses if the route is blocked or the table leaves view. Select **Show guides** or press **D** to see the detected tabletop outline and obstacle boxes.
 
 For a different webcam, list Windows camera names with `ffmpeg -hide_banner -list_devices true -f dshow -i dummy` and pass its name with `--camera "Camera Name"`.
 
