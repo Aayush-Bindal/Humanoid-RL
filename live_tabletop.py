@@ -22,6 +22,8 @@ from tabletop_demo import make_course, plan_route, position_clear, segment_clear
 
 VIDEO_SIZE = TABLE_SIZE
 CAMERA_FILTER = "scale=960:720:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=24"
+NEAR_EDGE_TARGET = 0.65
+TIGHT_ROUTE_CLEARANCE = 0.55
 
 
 def read_camera_frame(stream):
@@ -151,13 +153,31 @@ class OverlayWalker:
         if not self.spawned:
             raise ValueError("Clear a spot so the robot can spawn.")
         origin = tuple(self.sim.data.qpos[:2])
-        route = plan_route(self.boxes, origin, settings.clearance, destination)
+        # Keep the waiting point inside the robot's walking boundary even
+        # when the user taps directly next to the visible edge.
+        requested = destination
+        destination = (min(max(destination[0], NEAR_EDGE_TARGET), LENGTH - NEAR_EDGE_TARGET),
+                       min(max(destination[1], NEAR_EDGE_TARGET), SPAN - NEAR_EDGE_TARGET))
+        if not position_clear(destination, self.boxes, TIGHT_ROUTE_CLEARANCE):
+            raise ValueError("That spot is too close to an object. Tap a clear spot.")
+        route, clearance = self.route_to(origin, destination, settings.clearance)
         self.route = deque(route[1:])
         self.destination = destination
         self.settings = settings
+        self.route_clearance = clearance
         self.elapsed = 0
         self.distance = math.dist(origin, destination)
         self.status = "Walking to your marker"
+        return destination != requested
+
+    def route_to(self, origin, destination, clearance):
+        try:
+            return plan_route(self.boxes, origin, clearance, destination), clearance
+        except ValueError:
+            # A learned preference may need more room than the robot actually
+            # requires. Try a tighter route with clearance above the stop limit.
+            route = plan_route(self.boxes, origin, TIGHT_ROUTE_CLEARANCE, destination)
+            return route, TIGHT_ROUTE_CLEARANCE
 
     def remap(self, previous_table, table):
         """Keep the robot and marker over the same spots as the plane grows."""
@@ -191,13 +211,12 @@ class OverlayWalker:
         # Minor box jitter should not replace a route that still has clearance.
         if self.route:
             points = [origin, *self.route]
-            if all(segment_clear(a, b, boxes, self.settings.clearance - 0.12)
+            if all(segment_clear(a, b, boxes, self.route_clearance - 0.12)
                    for a, b in zip(points, points[1:])):
                 return
         try:
-            self.route = deque(plan_route(boxes, origin=origin,
-                                          clearance=self.settings.clearance,
-                                          destination=self.destination)[1:])
+            route, self.route_clearance = self.route_to(origin, self.destination, self.settings.clearance)
+            self.route = deque(route[1:])
             self.status = "Walking to your marker"
         except ValueError:
             self.route.clear()
@@ -409,21 +428,26 @@ def show_live(args):
         video_view = None
         notice = None
         notice_until = 0
+        tap_feedback = None
 
         def select_point(event):
-            nonlocal notice, notice_until
+            nonlocal notice, notice_until, tap_feedback
+            tap_feedback = (event.x, event.y)
+            notice_until = time.monotonic() + 3
             try:
                 if table is None or video_view is None:
                     raise ValueError("Wait for the tabletop to be detected.")
                 left, top, scale_x, scale_y = video_view
                 destination = table.world_point((event.x - left) / scale_x, (event.y - top) / scale_y)
-                walker.choose_destination(destination, settings)
-                notice = None
+                adjusted = walker.choose_destination(destination, settings)
+                notice = "Marker moved slightly inward to stay on the table." if adjusted else None
+                tap_feedback = None
             except ValueError as error:
                 notice = str(error)
-                notice_until = time.monotonic() + 3
 
-        picture.bind("<Button-1>", select_point)
+        picture.bind("<ButtonRelease-1>", select_point)
+        rejected_marker = picture.create_oval(0, 0, 0, 0, outline="#ffac72",
+                                              width=3, state="hidden")
 
         def show_frame(output):
             nonlocal video_view
@@ -470,7 +494,7 @@ def show_live(args):
                 next_scan = now + 0.18
             if table is None:
                 remaining_time = 0.0
-                status.set("Table out of view. Trip paused" if walker.destination is not None else
+                message = ("Table out of view. Trip paused" if walker.destination is not None else
                            "Looking for the white tabletop. Keep its edges visible.")
                 output = frame
             else:
@@ -486,10 +510,16 @@ def show_live(args):
                         except sqlite3.Error:
                             learning_status.set("Could not save the last trip")
                     walker.outcome = None
-                status.set(notice if notice and now < notice_until else
-                           f"{movement}  /  {len(walker.boxes)} detected objects")
+                message = f"{movement}  /  {len(walker.boxes)} detected objects"
                 output = walker.composite(frame, table, guides.get())
+            status.set(notice if notice and now < notice_until else message)
             show_frame(output)
+            if tap_feedback is not None and now < notice_until - 2:
+                x, y = tap_feedback
+                picture.coords(rejected_marker, x - 8, y - 8, x + 8, y + 8)
+                picture.itemconfigure(rejected_marker, state="normal")
+            else:
+                picture.itemconfigure(rejected_marker, state="hidden")
             elapsed_ms = round((time.monotonic() - now) * 1000)
             root.after(max(1, 33 - elapsed_ms), tick)
 
