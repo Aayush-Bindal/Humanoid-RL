@@ -10,6 +10,23 @@ from table_vision import TablePlane, TableTracker, find_table
 
 
 class TableTrackingTests(unittest.TestCase):
+    def test_uses_the_far_rim_when_a_bright_wall_merges_with_the_table(self):
+        frame = Image.new("RGB", (960, 540), "#635750")
+        draw = ImageDraw.Draw(frame)
+        draw.polygon(((470, 0), (935, 0), (959, 433), (0, 533)), fill="#c7c7c5")
+        draw.polygon(((360, 125), (780, 125), (959, 214), (959, 539), (0, 539)), fill="#eeebe9")
+        draw.polygon(((960, 205), (868, 249), (837, 282), (911, 426), (960, 458)), fill="#55534f")
+        draw.rounded_rectangle((508, 257, 652, 331), 10, fill="#46453e")
+
+        corners = find_table(frame)
+        self.assertIsNotNone(corners)
+        self.assertTrue(np.all((120 <= corners[:2, 1]) & (corners[:2, 1] < 150)))
+        self.assertLess(corners[1, 0], 815)
+        plane = TablePlane(corners)
+        with self.assertRaises(ValueError):
+            plane.world_point(620, 60)
+        self.assertTrue(plane.visible_in(frame))
+
     def test_finds_outer_edge_when_only_part_of_a_wide_table_is_bright(self):
         frame = Image.new("RGB", (960, 600), "#58545d")
         draw = ImageDraw.Draw(frame)

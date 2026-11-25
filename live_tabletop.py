@@ -24,6 +24,9 @@ VIDEO_SIZE = TABLE_SIZE
 CAMERA_FILTER = "scale=960:720:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=24"
 NEAR_EDGE_TARGET = 0.65
 TIGHT_ROUTE_CLEARANCE = 0.55
+MIN_ROUTE_CLEARANCE = 0.40
+STOP_CLEARANCE = 0.30
+TARGET_ADJUSTMENT = 0.60
 
 
 def read_camera_frame(stream):
@@ -139,15 +142,32 @@ class OverlayWalker:
         candidates = [START, (1.4, 1.1), (1.4, 3.9), (4.0, 1.1), (4.0, 3.9), (7.0, 2.5)]
         position = next((point for point in candidates if position_clear(point, self.boxes)), None)
         if position is None:
+            position = next(self.nearby_clear_points(START, TIGHT_ROUTE_CLEARANCE, LENGTH), None)
+        if position is None:
             self.status = "Clear a spot so the robot can spawn"
             return False
+        self.place_robot(position)
+        return True
+
+    def place_robot(self, position):
         self.env.reset(seed=0)
         qpos = self.sim.data.qpos.copy()
         qpos[:2] = position
         self.sim.set_state(qpos, np.zeros(self.sim.model.nv))
         self.spawned = True
         self.status = "Click a clear spot on the table"
-        return True
+
+    def nearby_clear_points(self, point, clearance, radius):
+        """Yield nearby positions in order of distance on the walking plane."""
+        points = []
+        for x in np.arange(NEAR_EDGE_TARGET, LENGTH - 0.5, 0.2):
+            for y in np.arange(NEAR_EDGE_TARGET, SPAN - 0.5, 0.2):
+                candidate = (float(x), float(y))
+                distance = math.dist(point, candidate)
+                if distance <= radius and position_clear(candidate, self.boxes, clearance):
+                    points.append((distance, candidate))
+        for _, candidate in sorted(points):
+            yield candidate
 
     def choose_destination(self, destination, settings):
         if not self.spawned:
@@ -158,26 +178,54 @@ class OverlayWalker:
         requested = destination
         destination = (min(max(destination[0], NEAR_EDGE_TARGET), LENGTH - NEAR_EDGE_TARGET),
                        min(max(destination[1], NEAR_EDGE_TARGET), SPAN - NEAR_EDGE_TARGET))
-        if not position_clear(destination, self.boxes, TIGHT_ROUTE_CLEARANCE):
-            raise ValueError("That spot is too close to an object. Tap a clear spot.")
-        route, clearance = self.route_to(origin, destination, settings.clearance)
+        if any(x1 <= requested[0] <= x2 and y1 <= requested[1] <= y2
+               for x1, y1, x2, y2 in self.boxes):
+            raise ValueError("An object covers that spot. Tap the clear table beside it.")
+        if not position_clear(destination, self.boxes, MIN_ROUTE_CLEARANCE):
+            destination = next(self.nearby_clear_points(destination, MIN_ROUTE_CLEARANCE,
+                                                        TARGET_ADJUSTMENT), None)
+            if destination is None:
+                raise ValueError("There is no room to stand there. Tap farther from the object.")
+
+        start = origin
+        if not position_clear(origin, self.boxes, MIN_ROUTE_CLEARANCE):
+            # Live detections can move an obstacle onto the current pose.
+            # Recover only after finding a new starting point with a route.
+            starts = self.nearby_clear_points(origin, TIGHT_ROUTE_CLEARANCE, 1.8)
+            for start in starts:
+                try:
+                    route, clearance = self.route_to(start, destination, settings.clearance)
+                except ValueError:
+                    continue
+                break
+            else:
+                raise ValueError("The robot is boxed in. Move the object beside it.")
+            self.place_robot(start)
+        else:
+            route, clearance = self.route_to(start, destination, settings.clearance)
         self.route = deque(route[1:])
         self.destination = destination
         self.settings = settings
         self.route_clearance = clearance
         self.elapsed = 0
-        self.distance = math.dist(origin, destination)
+        self.distance = math.dist(start, destination)
         self.status = "Walking to your marker"
-        return destination != requested
+        if start != origin:
+            return "Robot moved to a clear starting point and is walking to your marker."
+        if destination != requested:
+            return "Marker moved to a nearby clear spot."
+        return None
 
     def route_to(self, origin, destination, clearance):
-        try:
-            return plan_route(self.boxes, origin, clearance, destination), clearance
-        except ValueError:
-            # A learned preference may need more room than the robot actually
-            # requires. Try a tighter route with clearance above the stop limit.
-            route = plan_route(self.boxes, origin, TIGHT_ROUTE_CLEARANCE, destination)
-            return route, TIGHT_ROUTE_CLEARANCE
+        # A learned preference may need more room than the robot actually
+        # requires. Try tighter routes that still exceed the stop clearance.
+        for margin in (clearance, TIGHT_ROUTE_CLEARANCE):
+            try:
+                return plan_route(self.boxes, origin, margin, destination), margin
+            except ValueError:
+                continue
+        route = plan_route(self.boxes, origin, MIN_ROUTE_CLEARANCE, destination)
+        return route, MIN_ROUTE_CLEARANCE
 
     def remap(self, previous_table, table):
         """Keep the robot and marker over the same spots as the plane grows."""
@@ -211,7 +259,7 @@ class OverlayWalker:
         # Minor box jitter should not replace a route that still has clearance.
         if self.route:
             points = [origin, *self.route]
-            if all(segment_clear(a, b, boxes, self.route_clearance - 0.12)
+            if all(segment_clear(a, b, boxes, max(MIN_ROUTE_CLEARANCE, self.route_clearance - 0.12))
                    for a, b in zip(points, points[1:])):
                 return
         try:
@@ -250,7 +298,7 @@ class OverlayWalker:
                 self.spawned = False
                 self.spawn()
                 return self.finish(False, "Lost balance. Choose another spot")
-            if not position_clear(self.sim.data.qpos[:2], self.boxes, clearance=0.30):
+            if not position_clear(self.sim.data.qpos[:2], self.boxes, clearance=STOP_CLEARANCE):
                 self.sim.set_state(previous_pose, np.zeros(self.sim.model.nv))
                 return self.finish(False, "Stopped near an obstacle. Choose another spot")
             if self.elapsed >= 27:
@@ -439,8 +487,7 @@ def show_live(args):
                     raise ValueError("Wait for the tabletop to be detected.")
                 left, top, scale_x, scale_y = video_view
                 destination = table.world_point((event.x - left) / scale_x, (event.y - top) / scale_y)
-                adjusted = walker.choose_destination(destination, settings)
-                notice = "Marker moved slightly inward to stay on the table." if adjusted else None
+                notice = walker.choose_destination(destination, settings)
                 tap_feedback = None
             except ValueError as error:
                 notice = str(error)

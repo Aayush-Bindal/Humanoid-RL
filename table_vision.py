@@ -116,18 +116,27 @@ def outer_left_edge(neutral, brightness, bottom, inner_edge):
     return best, int(edge[0])
 
 
-def far_boundary(brightness, neutral, left, right, top):
+def far_boundary(brightness, neutral, left, right, top, bottom, *, search_wider=False):
     """Find a visible cross-table edge supported by several separated columns."""
-    left_x = float(np.polyval(left, top))
     right_x = float(np.polyval(right, top))
-    columns = np.arange(max(4, round(left_x) + 8), WIDTH - 4, 3)
-    expected_columns = (columns <= right_x).sum()
-    if len(columns) < 16:
-        return top, top, right_x, False
     # Average both sides of candidate edges and ignore isolated highlights.
     averaged = np.vstack((np.zeros(WIDTH), np.cumsum(brightness, axis=0)))
     best_score, best_edge = 0, (top, top, right_x, False)
-    for y in range(max(9, top - 9), min(HEIGHT - 10, top + 9)):
+    start = max(7, top - 9)
+    end = min(HEIGHT - 10, bottom - 42)
+    if search_wider:
+        start = max(7, top + 9)
+        end = min(end, top + 92)
+    else:
+        end = min(end, top + 9)
+    stride = 2 if search_wider else 1
+    for y in range(start, end, stride):
+        left_x = float(np.polyval(left, y))
+        right_x = float(np.polyval(right, y))
+        columns = np.arange(max(4, round(left_x) + 7), WIDTH - 4, 3)
+        if len(columns) < 16:
+            continue
+        expected_columns = (columns <= right_x).sum()
         for slope in np.arange(-0.16, 0.17, 0.025):
             rows = np.rint(y + (columns - left_x) * slope).astype(int)
             valid = (rows >= 6) & (rows < HEIGHT - 7)
@@ -143,7 +152,7 @@ def far_boundary(brightness, neutral, left, right, top):
             gaps = np.flatnonzero(np.diff(supported) > 25)
             if len(gaps):
                 supported = supported[:gaps[0] + 1]
-            if len(supported) < 11 or supported[0] - left_x > 35:
+            if len(supported) < 11 or supported[0] - left_x > 32:
                 continue
             if supported[-1] - supported[0] < (right_x - left_x) * 0.55:
                 continue
@@ -151,17 +160,20 @@ def far_boundary(brightness, neutral, left, right, top):
             sharpness = brightness[row + 2, col] - brightness[row - 2, col]
             score = (np.minimum(contrast[on_edge], 45).sum()
                      + np.minimum(sharpness[on_edge], 55).sum()
-                     - 6 * abs(y - top))
+                     - (1 if search_wider else 6) * abs(y - top))
             if score > best_score:
                 best_score = score
                 intercept = y - left_x * slope
                 left_y = round((slope * left[1] + intercept) / (1 - slope * left[0]))
                 right_y = round((slope * right[1] + intercept) / (1 - slope * right[0]))
                 observed_right = supported[-1]
-                if observed_right > np.polyval(right, right_y) + 5:
+                fitted_right = np.polyval(right, right_y)
+                if search_wider or observed_right > fitted_right + 5 or fitted_right > observed_right + 12:
+                    # A side fit can continue across the background beyond the
+                    # visible far edge, especially beside a bright wall or bag.
                     right_y = round(slope * observed_right + intercept)
                 else:
-                    observed_right = np.polyval(right, right_y)
+                    observed_right = fitted_right
                 best_edge = (left_y, right_y, observed_right, True)
     return best_edge
 
@@ -251,13 +263,21 @@ def find_table(frame):
         # divided the upper rows into spans too small for the initial scan.
         top = recovered[-1][0]
     size_scale = np.array([frame.width / WIDTH, frame.height / HEIGHT])
-    far = far_boundary(brightness, neutral, left, right, top)
+    far = far_boundary(brightness, neutral, left, right, top, bottom)
+    # White walls can connect the row scan to the top of the video. Require
+    # a visible cross-table edge before accepting that larger footprint.
+    if not far[3]:
+        recovered_far = far_boundary(brightness, neutral, left, right, top, bottom, search_wider=True)
+        if recovered_far[3]:
+            far = recovered_far
+        elif top <= 7:
+            return None
     quad = table_corners(neutral, left, right, bottom, far)
     paperlike = neutral | ((brightness >= 112) & (np.ptp(pixels, axis=2) < 31))
     outer = outer_left_edge(paperlike, brightness, bottom, left)
     if outer is not None:
         outer_edge, outer_top = outer
-        far = far_boundary(brightness, paperlike, outer_edge, right, outer_top)
+        far = far_boundary(brightness, paperlike, outer_edge, right, outer_top, bottom)
         expanded = table_corners(paperlike, outer_edge, right, bottom, far)
         if far[3] and expanded is not None and (quad is None or quad_area(expanded) >= 1.09 * quad_area(quad)):
             # The extra area must contain white surface in the camera.

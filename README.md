@@ -7,7 +7,7 @@ uv sync --locked
 uv run python tabletop_demo.py
 ```
 
-Point the webcam toward a white tabletop with its far edge and at least one side in view. When the robot appears, tap or click a clear spot on the table to send it there. A mint marker shows the destination. Taps at the edge place the marker slightly inward, and blocked taps flash an orange ring with a reason in the footer. Tap another spot to change the destination. The walker replans when objects block its route. If the table leaves view, the trip pauses and resumes from the same position when the tabletop is detected again.
+Point the webcam toward a white tabletop with its far edge and at least one side in view. When the robot appears, tap or click a clear spot on the table to send it there. A mint marker shows the destination. Taps near the edge or an object can move the marker to a nearby clear spot. Blocked taps flash an orange ring with a reason in the footer. Tap another spot to change the destination. The walker replans when objects block its route. If a new detection traps the robot, a valid tap can restart it from nearby clear space. If the table leaves view, the trip pauses and resumes from the same position when the tabletop is detected again.
 
 Resize the window or press **F11** for fullscreen. Press **Esc** to exit fullscreen. Turn on **Guides** with **D** to see the detected tabletop, obstacle boxes, and planned route.
 
