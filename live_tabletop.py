@@ -21,7 +21,30 @@ from tabletop_demo import make_course, plan_route, position_clear, segment_clear
 
 
 VIDEO_SIZE = TABLE_SIZE
-CAMERA_SIZE = (960, 600)
+CAMERA_FILTER = "scale=960:720:force_original_aspect_ratio=decrease:force_divisible_by=2,fps=24"
+
+
+def read_camera_frame(stream):
+    """Read one RGB PAM frame, including its uncropped dimensions."""
+    if stream.readline(80) != b"P7\n":
+        return None
+    header = {}
+    for _ in range(12):
+        line = stream.readline(80).strip()
+        if line == b"ENDHDR":
+            break
+        key, separator, value = line.partition(b" ")
+        if separator and value.isdigit():
+            header[key] = int(value)
+    else:
+        return None
+    width, height = header.get(b"WIDTH", 0), header.get(b"HEIGHT", 0)
+    if not (0 < width <= 960 and 0 < height <= 720
+            and header.get(b"DEPTH") == 3 and header.get(b"MAXVAL") == 255):
+        return None
+    size = width * height * 3
+    data = stream.read(size)
+    return Image.frombytes("RGB", (width, height), data) if len(data) == size else None
 
 
 class Webcam:
@@ -31,8 +54,8 @@ class Webcam:
         command = [
             "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
             "-f", "dshow", "-i", f"video={camera}", "-an",
-            "-vf", "crop=w='min(iw,ih*1.6)':h='min(ih,iw/1.6)',scale=960:600,fps=24",
-            "-pix_fmt", "rgb24", "-threads", "1", "-f", "rawvideo", "pipe:1",
+            "-vf", CAMERA_FILTER, "-pix_fmt", "rgb24",
+            "-c:v", "pam", "-threads", "1", "-f", "image2pipe", "pipe:1",
         ]
         try:
             self.process = subprocess.Popen(
@@ -46,12 +69,9 @@ class Webcam:
         self.reader.start()
 
     def read_frames(self):
-        size = CAMERA_SIZE[0] * CAMERA_SIZE[1] * 3
         with self.process.stdout as stream:
-            while raw := stream.read(size):
-                if len(raw) != size:
-                    break
-                self.frames.append(Image.frombytes("RGB", CAMERA_SIZE, raw))
+            while (frame := read_camera_frame(stream)) is not None:
+                self.frames.append(frame)
 
     def error(self):
         self.errors.seek(0)

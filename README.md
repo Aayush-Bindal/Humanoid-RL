@@ -1,6 +1,6 @@
 # Webcam-guided humanoid navigation
 
-Run from this project folder. On a fresh Windows machine, use Python 3.12 and uv to install the locked dependencies. The webcam stream uses FFmpeg on PATH with DirectShow input.
+Run from this project folder. On a fresh Windows machine, use Python 3.12 and uv to install the locked dependencies. The webcam stream uses FFmpeg on PATH with DirectShow input and scales the full camera view while preserving its aspect ratio.
 
 ```powershell
 uv sync --locked
@@ -23,6 +23,6 @@ uv run python tabletop_demo.py --live-sample
 
 ## How it works
 
-Live mode traces the visible table edges and maps them to a rectangular walking area. It can recover the far edge across gaps caused by objects. If several frames show more of the same table, it expands the map and keeps the robot and target anchored in the camera view. It detects objects within the map, plans around their footprints, then projects the humanoid back onto the table. Strong shadows, pale objects, or fully hidden edges can affect detection. The trained PPO policy drives the joints using MuJoCo state observations. A separate virtual harness assists balance and waypoint tracking.
+Live mode traces the visible table edges and maps them to a rectangular walking area. It searches outside the initial bright patch for a larger fit supported by the table edges. If several frames show more of the same table, it expands the map and keeps the robot and target anchored in the camera view. It detects objects within the map, plans around their footprints, then projects the humanoid back onto the table. Strong shadows, pale objects, or fully hidden edges can affect detection. The trained PPO policy drives the joints using MuJoCo state observations. A separate virtual harness assists balance and waypoint tracking.
 
 The original capture workflow remains available via `--snapshot`. It supports manual four-corner calibration and a separate MuJoCo viewer. Use `--images empty.jpg scene.jpg` for two photos or `--sample --headless` for its automated demonstration.
