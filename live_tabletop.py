@@ -393,7 +393,7 @@ class OverlayWalker:
             if self.route and self.spawned:
                 draw.line([(u, v), *((x / LENGTH * width, y / SPAN * height) for x, y in self.route)],
                           fill="#77f5cb", width=3)
-            for x1, y1, x2, y2 in self.boxes or ():
+            for x1, y1, x2, y2 in self.boxes:
                 draw.rectangle((x1 / LENGTH * width, y1 / SPAN * height,
                                 x2 / LENGTH * width, y2 / SPAN * height),
                                fill=(243, 161, 76, 24), outline=(243, 161, 76, 215), width=3)

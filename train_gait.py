@@ -324,7 +324,6 @@ def train(args):
         save_report(args.run_dir / "baseline-lower-lift.json", lower_lift_reference)
         print_report("Baseline with lower lift", lower_lift_reference)
 
-    set_num_threads(1)
     factories = [partial(ObstacleWalk, args.seed * 500 + index, args.grounded_reward,
                          args.lower_lift, args.phase_gait, pace_scale=pace_scale,
                          heading_weight=args.heading_weight)

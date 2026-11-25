@@ -4,20 +4,10 @@ from collections import deque
 import numpy as np
 from PIL import Image, ImageFilter
 
-from tabletop_demo import HEIGHT, LENGTH, SPAN, WIDTH, obstacle_boxes
+from tabletop_demo import HEIGHT, LENGTH, SPAN, WIDTH, obstacle_boxes, perspective
 
 
 TABLE_SIZE = (640, 400)
-
-
-def perspective(source, destination):
-    """Return Pillow's inverse mapping from output points to input points."""
-    rows, values = [], []
-    for (x, y), (u, v) in zip(source, destination):
-        rows.append((x, y, 1, 0, 0, 0, -u * x, -u * y))
-        rows.append((0, 0, 0, x, y, 1, -v * x, -v * y))
-        values.extend((u, v))
-    return np.linalg.solve(rows, values)
 
 
 def white_spans(row):

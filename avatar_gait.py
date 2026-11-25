@@ -74,7 +74,6 @@ class AvatarGait:
         self.yaw = yaw
         self.previous_position = np.array(position)
         self.velocity = np.zeros(2)
-        self.steps = 0
         self.next_side = 0
         self.swing = None
         self.arm_swing = 0.0
@@ -140,7 +139,6 @@ class AvatarGait:
             if phase == 1.0:
                 self.next_side = 1 - swing.side
                 self.swing = None
-                self.steps += 1
 
         lateral = np.array([-heading[1], heading[0]])
         if self.swing is not None:

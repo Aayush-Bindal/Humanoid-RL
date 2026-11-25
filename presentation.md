@@ -90,7 +90,7 @@ uv run python tabletop_demo.py
 ### Evidence and reading
 
 - Implementation in the project: `table_vision.py` (detection and projection), `tabletop_demo.py` (A* and clearance), `humanoid_ppo.py` and `train_gait.py` (training and evaluation), `avatar_gait.py` (planted pose), `live_tabletop.py` (live integration), `navigation_learning.py` (settings trials).
-- Experiment folder: `C:\Users\Lenovo\Documents\ChatGPT\ML\gait-experiment`. Slide 7 uses `humanoid-gait-comparison.mp4`; slide 8 uses `realistic-walk-comparison.mp4`. Slides 9–10 use `validation-selection.json`, `policy-benchmark.json`, `evaluation.json` and `policy-overlay-benchmark.json`.
+- The original experiment outputs are stored separately from the checkout. See [EXPERIMENT.md](EXPERIMENT.md) for commands to rerun the checks and generate comparison footage. Slide 7 uses `humanoid-gait-comparison.mp4`; slide 8 uses `realistic-walk-comparison.mp4`. Slides 9–10 use `validation-selection.json`, `policy-benchmark.json`, `evaluation.json` and `policy-overlay-benchmark.json`.
 - Slide 11: `IMG_3040.MOV`, 00:05 to 00:15, cropped to the laptop display. Slides 4–5 use the controlled image `Three objects on a white tabletop.png` processed by the current project code.
 - Methods referenced in the pitch: Schulman et al., *Proximal Policy Optimization Algorithms* (2017); Raffin et al., *Stable-Baselines3: Reliable Reinforcement Learning Implementations* (2021); Gymnasium, Farama Foundation; Todorov, Erez and Tassa, *MuJoCo: A Physics Engine for Model-Based Control* (2012).
 

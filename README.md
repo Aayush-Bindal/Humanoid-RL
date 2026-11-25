@@ -17,7 +17,7 @@ Click a clear spot on the generated table. To use a real webcam or OBS Virtual C
 uv run python tabletop_demo.py
 ```
 
-The app opens **cam0**. Use **Camera** to switch feeds. For OBS, add the tabletop image as an Image source, fit it to the scene, and start OBS Virtual Camera before opening Tabletop Walker. The app lists cameras at startup.
+The app opens **cam0**. Use **Camera** to switch feeds. For OBS, add the tabletop image as an Image source, fit it to the scene, and start OBS Virtual Camera before opening Tabletop Walker. The camera dropdown lists devices it found at startup. Run `--list-cameras` to see the same numbering in the terminal.
 
 | Control | What it does |
 | --- | --- |
@@ -40,6 +40,7 @@ If the app loses the table, the trip pauses and resumes when the surface is dete
 | `--live-sample` | Try the live overlay with a generated feed and a moving obstacle. |
 | `--list-cameras` | List DirectShow devices with their camera numbers. |
 | `--camera cam1` | Override the starting camera. A number or an exact device name also works. |
+| `--checkpoint path/to/policy.zip` | Start with a custom checkpoint. The two bundled policies are still available in the live picker. |
 | `--snapshot` | Calibrate from webcam snapshots and open a separate MuJoCo viewer. |
 | `--images empty.jpg scene.jpg` | Use two photos of the same surface from a fixed camera angle. |
 | `--sample --headless` | Run the snapshot workflow in simulation without a window. |
@@ -58,7 +59,7 @@ If the app loses the table, the trip pauses and resumes when the surface is dete
 | **Realistic walk** (default) | [Fine-tuned checkpoint](runs/experimental-gait/policy.zip) | A planted-foot animation follows the simulated trajectory. |
 | **Original** | [Baseline checkpoint](runs/baseline-seed0/policy.zip) | The original PPO policy with its raw simulated joint pose. |
 
-The planted-foot animation is applied at render time. Both policies use the same tabletop detector and route planner. See the [gait experiment](EXPERIMENT.md) for benchmark results, replay commands, and training instructions.
+The planted-foot animation changes the rendered pose. The simulator still uses the policy’s joint actions to advance the body and detect contacts. Both policies use the same tabletop detector and route planner. See the [gait experiment](EXPERIMENT.md) for benchmark results, replay commands, and training instructions.
 
 ## Tests
 

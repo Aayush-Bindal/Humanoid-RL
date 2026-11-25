@@ -87,19 +87,25 @@ def capture(camera):
         raise ValueError(f"{camera} did not deliver a frame within 15 seconds.") from error
 
 
+def perspective(output_points, input_points):
+    """Compute the homography mapping rectified pixels to source pixels."""
+    rows, values = [], []
+    for (x, y), (u, v) in zip(output_points, input_points):
+        rows.append((x, y, 1, 0, 0, 0, -u * x, -u * y))
+        rows.append((0, 0, 0, x, y, 1, -v * x, -v * y))
+        values.extend((u, v))
+    return np.linalg.solve(rows, values)
+
+
 def rectify(frame, corners):
     """Map the marked tabletop corners onto a top-down rectangle."""
     edges = np.roll(corners, -1, axis=0) - np.asarray(corners)
     turns = edges[:, 0] * np.roll(edges[:, 1], -1) - edges[:, 1] * np.roll(edges[:, 0], -1)
     if np.any(turns <= 0):
         raise ValueError("Mark the four corners in clockwise order, starting at the top left.")
-    rows, values = [], []
-    for (u, v), (x, y) in zip(((0, 0), (WIDTH, 0), (WIDTH, HEIGHT), (0, HEIGHT)), corners):
-        rows.append([u, v, 1, 0, 0, 0, -x * u, -x * v])
-        rows.append([0, 0, 0, u, v, 1, -y * u, -y * v])
-        values.extend((x, y))
+    rectified_corners = ((0, 0), (WIDTH, 0), (WIDTH, HEIGHT), (0, HEIGHT))
     try:
-        weights = np.linalg.solve(rows, values)
+        weights = perspective(rectified_corners, corners)
     except np.linalg.LinAlgError as error:
         raise ValueError("Mark four distinct corners of the tabletop.") from error
     return frame.transform((WIDTH, HEIGHT), Image.Transform.PERSPECTIVE, weights,
