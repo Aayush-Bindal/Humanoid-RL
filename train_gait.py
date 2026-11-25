@@ -41,15 +41,23 @@ def obstacle_layout(seed):
     return boxes
 
 
+def forward_distance(rotation, displacement):
+    """Project movement onto the torso's horizontal forward axis."""
+    heading = rotation[:2, 0]
+    return float(np.dot(heading, displacement) / max(np.linalg.norm(heading), 1e-8))
+
+
 class ObstacleWalk(gym.Env):
     def __init__(self, layout_seed, grounded_reward=False, lower_lift=False,
-                 phase_gait=False, phase_support=False, pace_scale=1.0):
+                 phase_gait=False, phase_support=False, pace_scale=1.0,
+                 heading_weight=0.0):
         super().__init__()
         self.grounded_reward = grounded_reward
         self.lower_lift = lower_lift
         self.phase_gait = phase_gait
         self.phase_support = phase_support or phase_gait
         self.pace_scale = pace_scale
+        self.heading_weight = heading_weight
         self.boxes = obstacle_layout(layout_seed)
         with TemporaryDirectory() as directory:
             self.course = make_course(self.boxes, [], directory, render=False, overlay=True)
@@ -95,7 +103,7 @@ class ObstacleWalk(gym.Env):
         self.steps = 0
         self.sums = dict(action_change=0.0, flight=0.0, single_support=0.0, lean=0.0,
                          slip=0.0, up_speed=0.0, left_support=0.0, right_support=0.0,
-                         switches=0, distance=0.0)
+                         switches=0, distance=0.0, forward_distance=0.0)
         return self.observation(), {}
 
     def observation(self):
@@ -149,6 +157,9 @@ class ObstacleWalk(gym.Env):
         lean = 1 - float(sim.data.xmat[self.torso, 8])
         up_speed = abs(float(sim.data.qvel[2]))
         progress = float(old_distance - np.linalg.norm(waypoint - sim.data.qpos[:2]))
+        displacement = sim.data.qpos[:2] - position
+        distance = float(np.linalg.norm(displacement))
+        forward = forward_distance(sim.data.xmat[self.torso].reshape(3, 3), displacement)
         self.previous_feet = foot_positions
         self.previous_action = action.copy()
         self.steps += 1
@@ -161,7 +172,8 @@ class ObstacleWalk(gym.Env):
         self.sums["slip"] += slip
         self.sums["left_support"] += grounded[0]
         self.sums["right_support"] += grounded[1]
-        self.sums["distance"] += float(np.linalg.norm(sim.data.qpos[:2] - position))
+        self.sums["distance"] += distance
+        self.sums["forward_distance"] += forward
 
         switched = False
         if support == 1:
@@ -180,6 +192,9 @@ class ObstacleWalk(gym.Env):
         # Reward directed motion, upright posture and alternating planted feet.
         # Penalize visible skating, bouncing and abrupt actuator changes.
         reward = 0.18 + 28 * progress + 0.045 * (support == 1) + 0.07 * switched
+        # Forward steps keep the full progress reward. Sideways and backward
+        # travel lose credit in proportion to distance, even on a detour.
+        reward -= self.heading_weight * max(0.0, distance - forward)
         reward -= (0.11 * (support == 0) + 0.11 * slip + 0.10 * up_speed
                    + 0.60 * lean + 0.24 * action_change + 0.25 * bad_contact
                    + 0.015 * float(np.mean(np.square(action))))
@@ -214,10 +229,11 @@ class ObstacleWalk(gym.Env):
         elapsed = self.steps * self.sim.dt
         measurements = {}
         for key, value in self.sums.items():
-            if key not in ("distance", "switches"):
+            if key not in ("distance", "forward_distance", "switches"):
                 measurements[key] = float(value / self.steps)
         measurements["support_imbalance"] = abs(measurements["left_support"] - measurements["right_support"])
         return dict(status=status, seconds=elapsed, speed=self.sums["distance"] / elapsed,
+                    heading_alignment=self.sums["forward_distance"] / max(self.sums["distance"], 1e-8),
                     switches_sec=self.sums["switches"] / elapsed, **measurements)
 
     def close(self):
@@ -250,19 +266,20 @@ def evaluate(model, seed, episodes, lower_lift=False, phase_support=False, pace_
     successful = finished or results
     means = {}
     for key in ("seconds", "speed", "action_change", "flight", "single_support", "lean",
-                "slip", "up_speed", "switches_sec", "support_imbalance"):
+                "slip", "up_speed", "switches_sec", "support_imbalance", "heading_alignment"):
         means[key] = float(np.mean([result[key] for result in successful]))
     return dict(counts={status: sum(result["status"] == status for result in results)
                         for status in statuses}, successful_means=means, episodes=results)
 
 
-def rank(summary):
+def rank(summary, heading_weight=0.0):
     counts, means = summary["counts"], summary["successful_means"]
     # Compare gait only after reliability. Prefer less jitter, foot slip and
     # airtime, with a time penalty so standing still cannot win.
     cost = (3 * means["action_change"] + 3 * means["flight"] + means["slip"]
             + means["up_speed"] + 2 * means["lean"] + 0.06 * means["seconds"]
-            + 0.65 * means["support_imbalance"])
+            + 0.65 * means["support_imbalance"]
+            + heading_weight * (1 - means["heading_alignment"]))
     return counts["arrived"], -counts["collision"], -cost
 
 
@@ -296,7 +313,9 @@ def warm_start_phase(baseline, env, options):
 def train(args):
     args.run_dir.mkdir(parents=True, exist_ok=False)
     baseline = PPO.load(args.baseline, device="cpu")
-    reference = evaluate(baseline, VALIDATION_SEED, args.validation)
+    pace_scale = getattr(baseline, "gait_pace_scale", 1.0)
+    reference = evaluate(baseline, VALIDATION_SEED, args.validation,
+                         lower_lift=getattr(baseline, "gait_lower_lift", False))
     save_report(args.run_dir / "baseline-validation.json", reference)
     print_report("Baseline validation", reference)
     if args.lower_lift or args.phase_gait:
@@ -307,7 +326,8 @@ def train(args):
 
     set_num_threads(1)
     factories = [partial(ObstacleWalk, args.seed * 500 + index, args.grounded_reward,
-                         args.lower_lift, args.phase_gait)
+                         args.lower_lift, args.phase_gait, pace_scale=pace_scale,
+                         heading_weight=args.heading_weight)
                  for index in range(args.envs)]
     vec = SubprocVecEnv(factories, start_method="spawn") if args.parallel else DummyVecEnv(factories)
     env = VecMonitor(vec, str(args.run_dir / "training"))
@@ -322,6 +342,7 @@ def train(args):
             model = PPO.load(args.baseline, env=env, **options)
         model.gait_lower_lift = args.lower_lift
         model.gait_phase_inputs = args.phase_gait
+        model.gait_pace_scale = pace_scale
         # Start near the pretrained gait instead of exploring with large torque noise.
         with no_grad():
             model.policy.log_std.clamp_(max=math.log(args.exploration))
@@ -338,7 +359,7 @@ def train(args):
             validation = evaluate(model, VALIDATION_SEED, args.validation, args.lower_lift)
             save_report(checkpoint.with_suffix(".json"), validation)
             print_report(f"{steps:,} new steps", validation)
-            if best is None or rank(validation) > rank(best):
+            if best is None or rank(validation, args.heading_weight) > rank(best, args.heading_weight):
                 best = validation
                 model.save(args.run_dir / "best.zip")
                 save_report(args.run_dir / "selection.json",
@@ -350,7 +371,8 @@ def train(args):
 def compare(args):
     baseline = PPO.load(args.baseline, device="cpu")
     candidate = PPO.load(args.checkpoint, device="cpu")
-    reference = evaluate(baseline, args.seed, args.episodes)
+    reference = evaluate(baseline, args.seed, args.episodes,
+                         lower_lift=getattr(baseline, "gait_lower_lift", False))
     phase_gait = getattr(candidate, "gait_phase_inputs", False)
     lower_lift = args.lower_lift or getattr(candidate, "gait_lower_lift", False) or phase_gait
     pace_scale = getattr(candidate, "gait_pace_scale", 1.0)
@@ -385,6 +407,8 @@ def main():
     training.add_argument("--grounded-reward", action="store_true")
     training.add_argument("--lower-lift", action="store_true")
     training.add_argument("--phase-gait", action="store_true")
+    training.add_argument("--heading-weight", type=float, default=0.0,
+                          help="penalty per meter of travel that is not forward (default: 0)")
     training.set_defaults(execute=train)
     comparison = commands.add_parser("compare")
     comparison.add_argument("checkpoint", type=Path)
@@ -395,6 +419,8 @@ def main():
     comparison.add_argument("--lower-lift", action="store_true")
     comparison.set_defaults(execute=compare)
     args = parser.parse_args()
+    if args.command == "train" and (not math.isfinite(args.heading_weight) or args.heading_weight < 0):
+        parser.error("--heading-weight must be a finite nonnegative number")
     set_num_threads(1)
     args.execute(args)
 

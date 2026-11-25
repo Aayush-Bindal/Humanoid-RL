@@ -111,7 +111,9 @@ class OverlayWalker:
         self.sim.model.geom("floor").group = 5
         self.scene_options.geomgroup[5] = 0
         self.camera = mujoco.MjvCamera()
-        self.camera.azimuth = 90
+        # The rectified tabletop's +y axis points toward the viewer.
+        # View from that side, then mirror the sprite to keep +x pointing right.
+        self.camera.azimuth = -90
         self.camera.elevation = -24
         self.camera.distance = 3.6
         vertical_fov = np.deg2rad(self.sim.model.vis.global_.fovy)
@@ -367,8 +369,8 @@ class OverlayWalker:
         bounds = avatar.getbbox()
         if bounds and self.gait is not None:
             sx, sy = project_ground(self.renderer, self.sim.model, (x, y))
-            self.avatar_anchor = (sx - bounds[0], sy - bounds[1])
-        return avatar.crop(bounds) if bounds else None
+            self.avatar_anchor = (bounds[2] - sx, sy - bounds[1])
+        return avatar.crop(bounds).transpose(Image.Transpose.FLIP_LEFT_RIGHT) if bounds else None
 
     def composite(self, frame, table, guides=False):
         """Project ground marks, then place the upright avatar at its ground point."""
@@ -445,8 +447,8 @@ def show_live(args):
     root.title("Tabletop Walker")
     background, panel, ink, accent = "#10171c", "#172228", "#eef5f5", "#8af0cc"
     root.configure(bg=background)
-    root.minsize(700, 500)
-    width = min(1180, round(root.winfo_screenwidth() * 0.88))
+    root.minsize(840, 500)
+    width = max(840, min(1180, round(root.winfo_screenwidth() * 0.88)))
     height = min(820, round(root.winfo_screenheight() * 0.86))
     root.geometry(f"{width}x{height}")
     header = tk.Frame(root, bg=background, padx=22, pady=15)
@@ -483,6 +485,24 @@ def show_live(args):
     policy_selector = ttk.Combobox(policy_control, values=tuple(choices), width=15,
                                    textvariable=selected_policy, state="readonly")
     policy_selector.pack(side="left")
+    if not args.live_sample:
+        cameras = {f"cam{index}: {name}": source
+                   for index, (name, source) in enumerate(args.camera_devices)}
+        initial_camera = next((label for label, source in cameras.items()
+                               if source == args.camera), args.camera)
+        for index, (name, _) in enumerate(args.camera_devices):
+            if name == args.camera:
+                initial_camera = f"cam{index}: {name}"
+                break
+        cameras.setdefault(initial_camera, args.camera)
+        camera_control = tk.Frame(header, bg=background)
+        camera_control.pack(side="right", padx=(0, 15))
+        tk.Label(camera_control, text="Camera", font=("Segoe UI", 10), bg=background,
+                 fg=ink).pack(side="left", padx=(0, 6))
+        selected_camera = tk.StringVar(value=initial_camera)
+        camera_selector = ttk.Combobox(camera_control, values=tuple(cameras), width=23,
+                                       textvariable=selected_camera, state="readonly")
+        camera_selector.pack(side="left")
     root.bind("<KeyPress-d>", lambda _: guides.set(not guides.get()))
     root.bind("<F11>", toggle_fullscreen)
     root.bind("<Escape>", lambda _: toggle_fullscreen() if fullscreen.get() else None)
@@ -543,14 +563,6 @@ def show_live(args):
                 learning_status.set(f"{activity}  /  {settings.name}  /  {attempts} trials")
 
         update_learning()
-        if not args.live_sample:
-            status.set("Opening webcam")
-            try:
-                webcam = Webcam(args.camera)
-            except OSError as error:
-                status.set(f"Could not start FFmpeg. {error}")
-                root.mainloop()
-                return
         started = time.monotonic()
         last_tick = started
         remaining_time = 0.0
@@ -602,6 +614,30 @@ def show_live(args):
         rejected_marker = picture.create_oval(0, 0, 0, 0, outline="#ffac72",
                                               width=3, state="hidden")
 
+        def switch_camera(_event=None):
+            nonlocal webcam, started, remaining_time, next_scan, table, tracker, video_view
+            nonlocal notice, tap_feedback
+            if webcam is not None:
+                webcam.close()
+                webcam = None
+            walker.reset()
+            tracker = TableTracker()
+            table = video_view = notice = tap_feedback = None
+            remaining_time = next_scan = 0
+            picture.itemconfigure(frame_item, image="")
+            picture.itemconfigure(rejected_marker, state="hidden")
+            label = selected_camera.get()
+            status.set(f"Opening {label}")
+            try:
+                webcam = Webcam(cameras[label])
+            except OSError as error:
+                status.set(f"Could not open {label}. {error}")
+            started = time.monotonic()
+
+        if not args.live_sample:
+            camera_selector.bind("<<ComboboxSelected>>", switch_camera)
+            switch_camera()
+
         def show_frame(output):
             nonlocal video_view
             canvas_width, canvas_height = picture.winfo_width(), picture.winfo_height()
@@ -629,15 +665,18 @@ def show_live(args):
             now = time.monotonic()
             elapsed = min(now - last_tick, 0.12)
             last_tick = now
-            if webcam is None:
+            if args.live_sample:
                 frame = sample_feed(now - started)
+            elif webcam is None:
+                root.after(250, tick)
+                return
             elif webcam.process.poll() is not None:
-                status.set(f"Could not stream {args.camera}. Check Windows camera access.\n{webcam.error()}")
+                status.set(f"Could not stream {selected_camera.get()}. Choose a camera above.\n{webcam.error()}")
+                root.after(250, tick)
                 return
             elif not webcam.frames:
                 if now - started > 12:
-                    status.set("No webcam frames received. Close other camera apps and restart.")
-                    return
+                    status.set("No webcam frames received. Close other camera apps or choose a different camera.")
                 root.after(40, tick)
                 return
             else:

@@ -12,6 +12,7 @@ import io
 import json
 import math
 from pathlib import Path
+import re
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -33,6 +34,36 @@ START, GOAL = (0.8, 2.5), (7.2, 2.5)
 CLEARANCE = 0.85
 BASELINE_CHECKPOINT = Path(__file__).resolve().parent / "runs/baseline-seed0/policy.zip"
 WALKING_CHECKPOINT = Path(__file__).resolve().parent / "runs/experimental-gait/policy.zip"
+
+
+def list_cameras():
+    """Return DirectShow video devices as (display name, input name) pairs."""
+    command = ["ffmpeg", "-nostdin", "-hide_banner", "-list_devices", "true",
+               "-f", "dshow", "-i", "dummy"]
+    try:
+        # FFmpeg prints the device list to stderr and exits with an error for dummy.
+        result = subprocess.run(command, capture_output=True, timeout=10)
+    except FileNotFoundError as error:
+        raise ValueError("FFmpeg must be on PATH to list Windows webcams.") from error
+    except subprocess.TimeoutExpired as error:
+        raise ValueError("FFmpeg timed out while listing Windows webcams.") from error
+
+    cameras = []
+    name = None
+    for line in result.stderr.decode("utf-8", errors="replace").splitlines():
+        device = re.search(r'\]\s+"(.*)"\s+\(([^)]+)\)\s*$', line)
+        if device:
+            display_name, device_type = device.groups()
+            # DirectShow can list a camera even when probing its media type fails.
+            name = display_name if device_type in {"video", "video, audio", "none"} else None
+            if name is not None:
+                cameras.append((name, name))
+        elif name is not None:
+            alternative = re.search(r'\]\s+Alternative name "(.*)"\s*$', line)
+            if alternative:
+                cameras[-1] = (name, alternative.group(1))
+            name = None
+    return cameras
 
 
 def capture(camera):
@@ -497,7 +528,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--checkpoint", type=Path, default=WALKING_CHECKPOINT,
                         help="initial policy checkpoint (default: realistic walk)")
-    parser.add_argument("--camera", default="Integrated Camera", help="Windows DirectShow camera name")
+    parser.add_argument("--camera", default="cam0",
+                        help="initial Windows camera name or number (default: cam0)")
+    parser.add_argument("--list-cameras", action="store_true", help="list Windows camera numbers and exit")
     parser.add_argument("--sample", action="store_true", help="rehearse with a generated scene")
     parser.add_argument("--live-sample", action="store_true", help="rehearse the live overlay without a webcam")
     parser.add_argument("--raw-gait", action="store_true", help="show the raw simulated pose in the live overlay")
@@ -508,6 +541,16 @@ def main():
     parser.add_argument("--threshold", type=int, choices=range(1, 256), metavar="1-255", default=32)
     parser.add_argument("--run-course", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.list_cameras:
+        try:
+            cameras = list_cameras()
+        except ValueError as error:
+            parser.error(str(error))
+        if not cameras:
+            parser.error("No DirectShow cameras found. Check that the webcam is connected and enabled.")
+        for index, (name, _) in enumerate(cameras):
+            print(f"cam{index}: {name}")
+        return 0
     if not args.checkpoint.is_file():
         parser.error(f"checkpoint not found: {args.checkpoint}")
     if args.run_course:
@@ -519,6 +562,19 @@ def main():
         parser.error("choose one demo mode")
     if args.live_sample and args.headless:
         parser.error("--live-sample opens the live overlay window")
+    uses_webcam = not (args.sample or args.images or args.live_sample or args.headless)
+    camera_index = re.fullmatch(r"(?:cam)?([0-9]+)", args.camera, re.IGNORECASE)
+    args.camera_devices = []
+    if uses_webcam and (camera_index or not args.snapshot):
+        try:
+            args.camera_devices = list_cameras()
+        except ValueError as error:
+            parser.error(str(error))
+    if uses_webcam and camera_index:
+        index = int(camera_index[1])
+        if index >= len(args.camera_devices):
+            parser.error(f"Camera cam{index} was not found. Run --list-cameras to see available cameras.")
+        args.camera = args.camera_devices[index][1]
     if args.live_sample or not (args.sample or args.images or args.snapshot or args.headless):
         from live_tabletop import show_live
         show_live(args)

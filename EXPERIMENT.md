@@ -35,6 +35,15 @@ To reproduce the stride training run:
 uv run python train_gait.py train --run-dir runs/retrain-gait --steps 491520 --interval 40960 --validation 16 --parallel --phase-gait --lower-lift --seed 12 --learning-rate 0.00020 --exploration 0.32
 ```
 
+To fine-tune Realistic walk for forward-facing movement:
+
+```powershell
+uv run python train_gait.py train --baseline runs/experimental-gait/policy.zip --run-dir runs/heading-gait --steps 32768 --interval 8192 --validation 8 --phase-gait --lower-lift --heading-weight 12 --learning-rate 0.00004 --exploration 0.18 --seed 16
+uv run python tabletop_demo.py --checkpoint runs/heading-gait/best.zip
+```
+
+The heading reward keeps full progress credit when the torso faces the direction it travels and reduces credit for sideways or backward motion. Validation reports `heading_alignment`, the fraction of traveled distance projected onto the torso's forward axis. A score of 1 means forward travel, 0 means sideways travel, and −1 means backward travel. Checkpoint selection prioritizes arrivals and collision avoidance before scoring gait and heading.
+
 ## Policy benchmark
 
 Both policies used the same 60 fresh obstacle courses (seeds 81000–81059). The matched-settings control ran the original policy at the new policy's pace and lift.
