@@ -5,92 +5,91 @@
 
 “At the proposal stage, we had shown that our reinforcement-learning setup could train an agent, and that we could capture camera and screen frames. Our next question was whether a real scene could guide a simulated humanoid. Today we can point a camera at a tabletop, click a destination, and watch the humanoid follow a route around objects. The camera tells us where it can walk. A planner chooses the route. A PPO policy controls the joints inside MuJoCo. We trained two walking policies, tested them on the same courses, and separately worked on how the walk looks in the camera view.”
 
-Keep three comparisons straight. Slide 7 changes the trained policy and some assistance settings. Slide 8 keeps the policy and route fixed and changes how the pose is drawn. Slide 10 measures outcomes in the physics simulator. These answer three different questions.
-
-**Suggested delivery:** Allow about nine minutes including the three short clips. One presenter can introduce the original question and explain the camera and planner (slides 1–5). The other can take training and evaluation (6–10). Hand back for the early recording and live demo. For the first handoff, ask “Once we have waypoints, how does the humanoid learn which joints to move?”
+Slides 2–5 follow a click from the camera to a route. Slides 6–10 cover training, the policy replay, checkpoint selection and the held-out benchmark. Slide 11 compares early and current footage. Slide 12 hands over to the live demo.
 
 ### Micro perspective — slide by slide
 
 #### 1. Vision-Guided Reinforcement Learning for Humanoid Locomotion
-**Say:** “This is the same project we pitched earlier. Here is what vision-guided locomotion looks like in our implementation.” Point to the cover figure. It is the project’s own simulated humanoid in mid-stride. The real webcam trial appears on slide 11. Leave algorithm names for the architecture slide.
-**Handoff:** “At the first review, those components were still separate.”
 
-#### 2. From capturing pixels to walking a route
-The earlier CartPole run exercised the SB3 training pipeline at roughly a million steps across 128 environments. It established that the team could collect rollouts, train, save a checkpoint and evaluate it. Camera and screen capture were exploratory prototypes then. CartPole weights did not initialize the humanoid; the humanoid baseline was trained in its own environment.
-**Say:** “The pitch asked how camera observations could guide locomotion. The architecture we could build and evaluate uses the camera for navigation and simulated state for joint control.” If asked about the original stand–balance–walk curriculum or Isaac GPU simulation, identify those as proposal directions. The completed runs used MuJoCo Humanoid-v5 and PPO.
-**Handoff:** “Here is the boundary between the camera and the controller.”
+Introduce the project with the click-to-walk task before naming the algorithms.
 
-#### 3. Where vision ends and joint control begins
-Trace a single click. A pixel location on the screen becomes a tabletop coordinate. The route planner checks whether it can connect that position to the robot’s position. The next waypoint gives a direction and desired speed. MuJoCo supplies the body state. Stable-Baselines3 uses the policy to predict continuous joint commands, and the simulator advances the body. A separate steering and balance harness applies forces and torques. This is assisted locomotion in simulation.
-**If asked what learns:** PPO learns joint control during training. Live navigation also compares a few fixed speed/clearance settings through practice and records outcomes per checkpoint in SQLite. Those practice trials do not update the PPO weights.
-**Handoff:** “First we need a coordinate system that makes a click meaningful.”
+The project title comes from our pitch. We use a camera to guide navigation and train the joint controller in simulation. The real tabletop supplies the scene; the humanoid is a simulated body.
 
-#### 4. A tabletop becomes a walking map
-The two views use the same controlled tabletop image. The green outline and orange boxes come from the project detector. Show the far edge first, then the red block in both views. The detector finds bright, fairly neutral spans, fits edges, estimates four corners and waits for repeated evidence before locking the plane. A homography maps that quadrilateral to a rectangle. After rectification, the detector estimates local background brightness by row and groups contrasting pixels into boxes.
-**Qualification:** The method approximates each object’s footprint from appearance. It has no depth camera or object-class labels. White objects, deep shadows, clipped edges and a large box covering the near surface can all confuse detection. For the demo, use a white board with visible boundaries and a few dark objects. The project includes manual corner selection in snapshot mode.
-**Handoff:** “Once the scene is on a plane, obstacle avoidance becomes a geometric problem.”
+#### 2. From the original pitch to the final demo
 
-#### 5. A click behind an obstacle needs a detour
-Follow the green path from left to right. This path was computed on the previous slide’s obstacle boxes. A straight line would pass too close to an object once body clearance is included. The planner tests direct visibility first, searches a four-neighbor grid at spacing 0.1 in course coordinates if needed, then removes intermediate grid points when a longer segment is clear. Wider clearance gives the body more room but can eliminate narrow passages.
-**If asked about changes mid-trip:** Live detections are refreshed. If boxes change, the app can replan. A lost table pauses the trip. If a new obstacle blocks the walker and the algorithm cannot find safe clearance, it can stop and request another destination.
-**Handoff:** “These waypoints say where the humanoid should go. They still don’t say which joints to move.”
+Explain how the team connected its pitch prototypes into one working demo.
 
-#### 6. How we trained the two walking policies
-PPO means Proximal Policy Optimization. The agent collects experience by acting in simulation. Each transition supplies an observation, action, reward and next observation. PPO uses batches of this experience to update a policy while limiting large changes in action probabilities. The data is generated by interaction, so there is no set of labeled webcam pictures teaching joint angles.
-The original Humanoid-v5 checkpoint records 1,000,448 steps. The fine-tune started with baseline weights. Its observation includes a periodic stride clock and steering information alongside simulator state. During warm start, the added input weights begin at zero. Training then gives the policy a chance to use those features. Rewards favor progress, upright posture and consistent foot placement, with penalties for slipping, bouncing and abrupt action changes. Falling or hitting an obstacle ends an episode with a penalty.
-**Explain the numbers:** The second figure is 491,520 fine-tuning steps. The million-step CartPole run mentioned on slide 2 is a different experiment. Both bundled humanoid policies use CPU inference.
+The pitch milestones were capture and RL prototypes. Our final deliverable connects a physical scene to a simulated walking task and lets the user choose between the two checkpoints.
 
-#### 7. Original PPO and the obstacle fine-tune
-**Cue:** In desktop PowerPoint Slide Show, the embedded eight-second excerpt is set to start when this slide appears. “Watch the timing of the steps as the two humanoids round the obstacle.” Original PPO is on the left. The obstacle fine-tune is on the right. Both follow the same course, but the fine-tune uses its selected pace and reduced vertical assistance. A single replay illustrates behavior and cannot isolate the effect of training by itself.
-**If asked why the harness matters:** Changing lift can directly change how often feet contact the ground. That is why slide 10 includes the original policy running with the new assistance and pace.
+#### 3. What runs after you click?
 
-#### 8. Watch the supporting foot through the turn
-**Cue:** Let the eight-second embedded excerpt run in Slide Show. “This time the trajectory and the trained policy are the same. Look at the supporting foot as the body moves over it.” The raw pose is on the left. On the right a rendering layer selects a stance foot, holds its target at a ground coordinate, and moves the swing foot toward the next landing point. A damped inverse-kinematics solve adjusts the display rig’s leg joints to reach those targets.
-The visual pose lives in separate MuJoCo data. Collision decisions, falls, and the benchmark’s contact measurements use the physical simulation. In the webcam overlay the sprite’s camera orientation also has to agree with the tabletop projection, especially for motion toward the viewer.
-**Handoff:** “We evaluated the trained controller in physics as a separate question.”
+Trace one click from the image to the waypoint and finally to a joint action.
 
-#### 9. Which checkpoint should run in the demo?
-These bars are validation results at four saved training checkpoints, all at a common 1.30× pace. The chart starts at zero. The percentages show how often at least one foot contacted the floor. All four finished the 16 validation routes at this pace. The 327,680-step value dips before later checkpoints improve; a longer run does not guarantee a better gait on every metric.
-The full selection file also includes a 1.22× pace. Candidate selection considered completion and gait quality. The selected 491,520-step checkpoint at 1.30× had 39.1% contact on this validation batch. The 38.8% on the next slide is a separate result on fresh courses.
+The app rescans the scene at a nominal interval of 0.18 seconds. PPO runs on CPU and receives simulator observations. The camera and A* are engineered components. Navigation-learning trials tune speed and clearance separately.
 
-#### 10. Both default policies finished 60 of 60 courses
-Read the first two rows together. On seeds 81000–81059 both default configurations finished all 60 courses with zero falls or obstacle contacts. Realistic walk averaged 8.81 seconds versus 9.54 for Original. Ground contact increased by 29.2 percentage points. “Foot contact” means at least one simulated foot was touching the floor on a physics step. The displayed animation does not enter that calculation.
-Now read the third row. At matched lift and pace, Original finished 57 of 60 and fell three times. Its mean time of 8.35 seconds excludes the three failures. Comparing times alone would hide that tradeoff. Earlier testing on another 40 courses gave Original 40/40 and the fine-tune 39/40. In 24 simulated overlay trips per policy, including changing obstacles on 12, Original finished 24 and the fine-tune finished 23, stopping near an obstacle once.
-**If asked about moving backward:** A separate 32,768-step heading-reward run penalized movement away from the torso’s forward direction. Both models finished 24/24 additional test routes. Average heading alignment was about 0.951 for the existing checkpoint and 0.949 for the candidate. The existing checkpoint stayed the default.
-**Handoff:** “Those results are from controlled simulation. Here’s how a physical tabletop enters the system.”
+#### 4. One camera view, two coordinate systems
 
-#### 11. Before we fixed the walking pose
-**Cue:** Play the ten-second excerpt (00:05 to 00:15 in the phone recording). Point out which way the torso faces and which way the humanoid travels. Give the audience a few seconds to watch before speaking.
+Point to the same object in the camera view and in the rectangular map.
 
-**Say:** "This is an early run on our laptop. The character could move across the tabletop, but sometimes it faced sideways or backwards as it walked. That was the walking pose we wanted to improve."
+This controlled test image is generated. In a 960 × 540 synthetic boundary test, a uniform light frame produced no plane. Adding a 17-pixel dark strip across the top produced a fit. These are fixture results. We have no measured real-camera accuracy or calibration error. Snapshot mode can use four manually marked corners.
+
+#### 5. Finding a route with room for the body
+
+Follow the line across the three panels. The square is the obstacle and the dots mark the endpoints.
+
+All three panels come from the same call to the project planner. The first is the rejected direct segment, the second is the reconstructed search path and the third is the simplified route. The clearance is in modeled table units. The live planner can retry tighter margins when the preferred clearance blocks every route.
+
+#### 6. Two stages of PPO training
+
+The two figures count simulator transitions. The second training stage starts from the first policy’s weights.
+
+Original PPO logged 1,000,448 transitions. The obstacle fine-tune logged 491,520. Its reward also includes upright posture, action smoothness and a phase-dependent foot placement target. The +28 term rewards moving toward the current waypoint. Training and validation use a steering and balance harness.
+
+#### 7. How the policies changed during training
+
+Read each column vertically: reward above, episode length below. Compare trends within a stage because the reward function changes between stages.
+
+Source: four baseline monitor CSVs and the obstacle-gait-phase training monitor. We sorted completed episodes by their logged end time and split each stage into ten equal-count groups. The x-axis is training order by episode decile; axes use each stage’s own units. An obstacle episode can end early on arrival as well as on failure.
+
+#### 8. How training changed the walk
+
+Let the clip play. Original PPO is on the left and Realistic walk is on the right. Ask the audience to watch how each body turns.
+
+Both policies were trained with PPO. Original learned on Humanoid-v5. Realistic walk was fine-tuned on obstacle routes with stride-phase and steering inputs. The replay shows the physical simulation for each configuration, including its pace and assistance settings.
+
+#### 9. Which checkpoint kept a foot on the ground?
+
+Read the percentage as a share of sampled simulation steps. The remaining steps had neither foot touching the ground.
+
+We compared four checkpoints from one training run. Pace multiplies the speed command. This is a selection set, so the 39.1% value is descriptive. The held-out benchmark uses different course seeds. Contact is calculated from physical foot-floor collisions at policy steps, before any display pose is applied.
+
+#### 10. Both default policies reached every goal
+
+Start with the two default configurations, then explain the three falls in the matched-settings control. SD is the spread of completion times among successful runs.
+
+Seeds 81000–81059. Sample SD describes variation across finished courses. For the two defaults, we resampled 60 paired course time differences 20,000 times with seed 7 and used percentile endpoints. This interval describes variation across courses for these fixed policies. We did not repeat training across seeds. The matched baseline’s mean excludes its three falls. Support switches per second on finishes were 0.60 for Original and 5.28 for the fine-tune; rapid switches can include brief contact flicker.
+
+#### 11. From the early trial to the trained walk
+
+Play the two clips together. The phone recording is the earlier tabletop build and the right panel shows the current simulation on a different route.
+
+Left: the requested 00:05–00:15 excerpt of the early phone recording. Right: a simulation replay from a different run. PPO learns the joint actions. At display time the renderer aligns the body with travel and holds the supporting foot steady. Heading-reward fine-tuning did not improve the held-out score.
 
 #### 12. Live demo
-**Handoff:** "Let's try the current version live. Pick a clear spot on the other side of the obstacle and we'll send the humanoid there."
 
-For a live demonstration, run these commands from the humanoid-rl project directory:
+Launch from the project directory with `uv run python tabletop_demo.py`. Turn on Guides, wait for the table outline and invite someone to choose a destination. After switching policies, click a new destination.
 
-```powershell
-uv run python tabletop_demo.py
-```
-
-1. Connect the camera before launching. On Windows, FFmpeg with DirectShow support must be available. If using OBS, start its virtual camera first and frame the full tabletop.
-2. Select the feed, leave Realistic walk selected, enable Guides, and wait for the outline.
-3. Click a clear destination across an obstacle. Follow the route line before pointing at the gait.
-4. To compare policies, switch to Original and click a destination again. Changing the policy clears the previous destination.
-5. If the table fails to lock, launch the generated live feed with `uv run python tabletop_demo.py --live-sample`. The generated feed is a rehearsal mode.
+Invite someone to choose a clear spot beyond an obstacle. Open the live app, select the camera, enable Guides and wait for a tabletop outline. For a camera-free rehearsal use tabletop_demo.py --live-sample. The demo uses a simulated balance harness; the physical camera supplies the scene geometry.
 
 ### Questions to rehearse
 
 - **Does PPO read the webcam?** The vision and planning pipeline consumes webcam pixels. The joint policy consumes MuJoCo state; the fine-tune also receives phase and steering inputs.
 - **Why use a planner as well as RL?** The planner can explicitly enforce obstacle clearance in the measured map. PPO solves the continuous-action part of moving the body along the resulting route.
-- **What does “realistic” mean here?** It is the name of the fine-tuned policy configuration and the default planted-foot display. The deck evaluates physical contact and shows the animation separately. No human motion-capture similarity or hardware transfer result was measured.
+- **What does “realistic” mean here?** It is the name of the fine-tuned policy configuration and the display that steadies the supporting foot. The deck evaluates physical contact and shows the animation separately. No human motion-capture similarity or hardware transfer result was measured.
 - **Can we use any floor?** Automatic live detection works best on a bright neutral plane with clear edges. Snapshot mode supports manual corner calibration and comparison of an empty reference with a later scene.
 - **What evidence should we show if challenged?** Use the per-episode benchmark and overlay JSON, rather than drawing a conclusion from one successful clip.
 
 ### Evidence and reading
 
-- Implementation in the project: `table_vision.py` (detection and projection), `tabletop_demo.py` (A* and clearance), `humanoid_ppo.py` and `train_gait.py` (training and evaluation), `avatar_gait.py` (planted pose), `live_tabletop.py` (live integration), `navigation_learning.py` (settings trials).
-- The original experiment outputs are stored separately from the checkout. See [EXPERIMENT.md](EXPERIMENT.md) for commands to rerun the checks and generate comparison footage. Slide 7 uses `humanoid-gait-comparison.mp4`; slide 8 uses `realistic-walk-comparison.mp4`. Slides 9–10 use `validation-selection.json`, `policy-benchmark.json`, `evaluation.json` and `policy-overlay-benchmark.json`.
-- Slide 11: `IMG_3040.MOV`, 00:05 to 00:15, cropped to the laptop display. Slides 4–5 use the controlled image `Three objects on a white tabletop.png` processed by the current project code.
-- Methods referenced in the pitch: Schulman et al., *Proximal Policy Optimization Algorithms* (2017); Raffin et al., *Stable-Baselines3: Reliable Reinforcement Learning Implementations* (2021); Gymnasium, Farama Foundation; Todorov, Erez and Tassa, *MuJoCo: A Physics Engine for Model-Based Control* (2012).
-
+- Implementation in the project: `table_vision.py` (detection and projection), `tabletop_demo.py` (A* and clearance), `humanoid_ppo.py` and `train_gait.py` (training and evaluation), `avatar_gait.py` (display pose), `live_tabletop.py` (live integration), `navigation_learning.py` (settings trials).
+- [Gait experiments and reproduction commands](EXPERIMENT.md)
